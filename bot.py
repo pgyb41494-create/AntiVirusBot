@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Discord bot that logs AV simulation events per-server (no global channel ID)."""
+"""SystemPulse Discord bot — live AV research telemetry per server."""
 
 from __future__ import annotations
 
@@ -24,11 +24,31 @@ BOT_API_KEY = os.getenv("BOT_API_KEY", "")
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "2"))
 CONFIG_PATH = Path(__file__).parent / "data" / "guilds.json"
 
+PULSE_COLOR = 0x3D6FA8
+
 STATUS_COLORS = {
-    "success": 0x22C55E,
-    "failed": 0xEF4444,
-    "blocked": 0xF59E0B,
-    "simulated": 0xA78BFA,
+    "success": 0x3D9A6E,
+    "failed": 0xC45C5C,
+    "blocked": 0xC49A3A,
+    "simulated": 0x5B8FD4,
+}
+
+MODULE_LABELS = {
+    "eicar": "EICAR Drop",
+    "self_copy": "Self Replication",
+    "persistence": "Registry Persistence",
+    "process_injection": "Process Injection",
+    "powershell": "Encoded PowerShell",
+    "defender": "Defender Tamper",
+    "keylogger": "Keylogger Hook",
+    "screenshot": "Screenshot Capture",
+    "clipboard": "Clipboard Steal",
+    "webcam": "Webcam Access",
+    "cookies": "Browser Cookies",
+    "file_read": "File Harvest",
+    "crypto_hunt": "Crypto Wallets",
+    "location": "Geo Location",
+    "network": "C2 Callback",
 }
 
 MODULE_EMOJI = {
@@ -55,6 +75,8 @@ intents.guilds = True
 http_client: httpx.AsyncClient | None = None
 _commands_synced = False
 _poll_task: asyncio.Task | None = None
+
+pulse = app_commands.Group(name="pulse", description="SystemPulse AV research telemetry")
 
 
 @dataclass
@@ -96,13 +118,12 @@ class GuildStore:
 store = GuildStore.load()
 
 
-class AvBot(commands.Bot):
+class SystemPulseBot(commands.Bot):
     def __init__(self) -> None:
-        # No prefix — slash commands only (avoids duplicate / conflicting text commands).
         super().__init__(command_prefix=None, intents=intents)
 
     async def setup_hook(self) -> None:
-        # Register slash commands once at startup, before connect.
+        self.tree.add_command(pulse)
         self.add_listener(self._on_ready_sync, "on_ready")
 
     async def _on_ready_sync(self) -> None:
@@ -114,7 +135,7 @@ class AvBot(commands.Bot):
         print(f"[bot] Synced {len(synced)} slash command(s) globally")
 
 
-bot = AvBot()
+bot = SystemPulseBot()
 
 
 def _headers() -> dict[str, str]:
@@ -130,23 +151,65 @@ def _guild_id(interaction: discord.Interaction) -> str | None:
     return str(interaction.guild.id)
 
 
+def _module_label(module: str) -> str:
+    return MODULE_LABELS.get(module, module.replace("_", " ").title())
+
+
+def _event_host(event: dict) -> str:
+    payload = event.get("payload")
+    if isinstance(payload, dict):
+        host = payload.get("hostname")
+        if host and isinstance(host, str):
+            return host
+    return "Unknown"
+
+
+def _event_user(event: dict) -> str:
+    payload = event.get("payload")
+    if isinstance(payload, dict):
+        user = payload.get("username")
+        if user and isinstance(user, str):
+            return user
+    return "—"
+
+
+def _parse_ts(iso: str | None) -> datetime:
+    if not iso:
+        return datetime.now(timezone.utc)
+    try:
+        return datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    except ValueError:
+        return datetime.now(timezone.utc)
+
+
 def _embed_for_event(event: dict) -> discord.Embed:
     module = event.get("module", "unknown")
-    emoji = MODULE_EMOJI.get(module, "🔔")
+    emoji = MODULE_EMOJI.get(module, "📡")
+    label = _module_label(module)
     status = event.get("status", "unknown")
-    color = STATUS_COLORS.get(status, 0x3B82F6)
+    color = STATUS_COLORS.get(status, PULSE_COLOR)
+    hostname = _event_host(event)
+    username = _event_user(event)
 
     embed = discord.Embed(
-        title=f"{emoji} {module} — {event.get('action', '')}",
+        title=f"{emoji} {label}",
+        description=f"**Action:** `{event.get('action', '—')}`",
         color=color,
-        timestamp=datetime.now(timezone.utc),
+        timestamp=_parse_ts(event.get("created_at")),
     )
-    embed.add_field(name="Status", value=status.upper(), inline=True)
-    embed.add_field(name="Detected", value="✅ Yes" if event.get("detected") else "❌ No", inline=True)
-    embed.add_field(name="Blocked", value="🛑 Yes" if event.get("blocked") else "— No", inline=True)
-
-    if event.get("session_id"):
-        embed.add_field(name="Session", value=f"`{str(event['session_id'])[:8]}…`", inline=True)
+    embed.add_field(name="Host", value=f"`{hostname}`", inline=True)
+    embed.add_field(name="User", value=f"`{username}`", inline=True)
+    embed.add_field(name="Status", value=f"`{status.upper()}`", inline=True)
+    embed.add_field(
+        name="Detected",
+        value="Yes" if event.get("detected") else "No",
+        inline=True,
+    )
+    embed.add_field(
+        name="Blocked",
+        value="Yes" if event.get("blocked") else "No",
+        inline=True,
+    )
     embed.add_field(name="Event ID", value=str(event.get("id", "?")), inline=True)
 
     if event.get("error_message"):
@@ -154,10 +217,12 @@ def _embed_for_event(event: dict) -> discord.Embed:
 
     payload = event.get("payload")
     if payload and isinstance(payload, dict):
-        preview = str(payload)[:400]
-        embed.add_field(name="Payload", value=f"```json\n{preview}\n```", inline=False)
+        extra = {k: v for k, v in payload.items() if k not in ("hostname", "username", "os")}
+        if extra:
+            preview = json.dumps(extra, default=str)[:380]
+            embed.add_field(name="Details", value=f"```json\n{preview}\n```", inline=False)
 
-    embed.set_footer(text="AntiVirusBot · AV Research Logger")
+    embed.set_footer(text="SystemPulse · Live Telemetry")
     return embed
 
 
@@ -171,17 +236,28 @@ async def _fetch_latest_event_id() -> int:
     return int(events[0]["id"])
 
 
-async def _fetch_events_since(since_id: int) -> list[dict]:
+async def _fetch_events(limit: int = 50, since_id: int | None = None) -> list[dict]:
     assert http_client is not None
+    params: dict[str, int] = {"limit": limit}
+    if since_id is not None:
+        params["since_id"] = since_id
     res = await http_client.get(
         f"{API_URL}/api/events",
-        params={"since_id": since_id, "limit": 100},
-        headers=_headers(),
+        params=params,
+        headers=_headers() if since_id is not None else None,
     )
     res.raise_for_status()
     events: list[dict] = res.json()
     events.sort(key=lambda e: int(e.get("id", 0)))
     return events
+
+
+async def _fetch_stats() -> dict | None:
+    assert http_client is not None
+    res = await http_client.get(f"{API_URL}/api/stats")
+    if not res.is_success:
+        return None
+    return res.json()
 
 
 async def poll_events() -> None:
@@ -200,7 +276,7 @@ async def poll_events() -> None:
 
         try:
             since_id = min(w.last_event_id for w in store.watches.values())
-            events = await _fetch_events_since(since_id)
+            events = await _fetch_events(limit=100, since_id=since_id)
 
             if not events:
                 await asyncio.sleep(POLL_INTERVAL)
@@ -238,12 +314,12 @@ async def poll_events() -> None:
         await asyncio.sleep(POLL_INTERVAL)
 
 
-@bot.tree.command(name="watch", description="Log AV simulation events in this channel")
+@pulse.command(name="link", description="Start posting live scan events to this channel")
 @app_commands.guild_only()
-async def slash_watch(interaction: discord.Interaction) -> None:
+async def pulse_link(interaction: discord.Interaction) -> None:
     gid = _guild_id(interaction)
     if gid is None or interaction.channel is None:
-        await interaction.response.send_message("Use this in a server channel.", ephemeral=True)
+        await interaction.response.send_message("Use this in a server text channel.", ephemeral=True)
         return
 
     latest = 0
@@ -258,17 +334,22 @@ async def slash_watch(interaction: discord.Interaction) -> None:
     )
     store.save()
 
-    await interaction.response.send_message(
-        f"✅ Logging enabled in {interaction.channel.mention}. "
-        f"Only **new** events after ID `{latest}` will be posted.\n"
-        f"Use `/reset` to skip backlog and catch new events faster.",
-        ephemeral=True,
+    embed = discord.Embed(
+        title="SystemPulse linked",
+        description=(
+            f"Live telemetry will post in {interaction.channel.mention}.\n\n"
+            f"**Cursor:** event `{latest}` — only newer events are sent.\n"
+            f"Run `/pulse live` before a scan to skip old backlog."
+        ),
+        color=PULSE_COLOR,
     )
+    embed.set_footer(text="SystemPulse")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@bot.tree.command(name="unwatch", description="Stop logging events in this server")
+@pulse.command(name="unlink", description="Stop live event posts for this server")
 @app_commands.guild_only()
-async def slash_unwatch(interaction: discord.Interaction) -> None:
+async def pulse_unlink(interaction: discord.Interaction) -> None:
     gid = _guild_id(interaction)
     if gid is None:
         await interaction.response.send_message("Use this in a server.", ephemeral=True)
@@ -277,17 +358,14 @@ async def slash_unwatch(interaction: discord.Interaction) -> None:
     if gid in store.watches:
         del store.watches[gid]
         store.save()
-        await interaction.response.send_message("🛑 Logging stopped for this server.", ephemeral=True)
+        await interaction.response.send_message("Unlinked — this server will no longer receive events.", ephemeral=True)
     else:
-        await interaction.response.send_message("This server is not being watched.", ephemeral=True)
+        await interaction.response.send_message("This server is not linked. Use `/pulse link` first.", ephemeral=True)
 
 
-@bot.tree.command(
-    name="reset",
-    description="Skip backlog for this server — only new events from now (faster)",
-)
+@pulse.command(name="live", description="Jump to now — only post events from the next scan onward")
 @app_commands.guild_only()
-async def slash_reset(interaction: discord.Interaction) -> None:
+async def pulse_live(interaction: discord.Interaction) -> None:
     gid = _guild_id(interaction)
     if gid is None:
         await interaction.response.send_message("Use this in a server.", ephemeral=True)
@@ -296,7 +374,7 @@ async def slash_reset(interaction: discord.Interaction) -> None:
     watch = store.watches.get(gid)
     if not watch:
         await interaction.response.send_message(
-            "Run `/watch` in the channel you want first.", ephemeral=True
+            "Link a channel first with `/pulse link`.", ephemeral=True
         )
         return
 
@@ -311,62 +389,167 @@ async def slash_reset(interaction: discord.Interaction) -> None:
     store.save()
 
     await interaction.response.send_message(
-        f"⏩ **Reset for this server.** Cursor `{old_id}` → `{latest}`.\n"
-        "New simulator events will post immediately — no old backlog.",
+        f"Live mode updated. Cursor `{old_id}` → `{latest}`.\n"
+        "Run **SystemPulse.exe** now — new events will appear immediately.",
         ephemeral=True,
     )
 
 
-@bot.tree.command(name="status", description="Bot and API status for this server")
+@pulse.command(name="stats", description="Show API health and scan totals")
 @app_commands.guild_only()
-async def slash_status(interaction: discord.Interaction) -> None:
+async def pulse_stats(interaction: discord.Interaction) -> None:
     gid = _guild_id(interaction)
     watch = store.watches.get(gid or "")
 
     api_ok = False
-    total = "?"
+    storage = "?"
+    stats: dict | None = None
     try:
         assert http_client is not None
-        res = await http_client.get(f"{API_URL}/api/health")
-        api_ok = res.status_code == 200
-        stats = await http_client.get(f"{API_URL}/api/stats")
-        if stats.ok:
-            total = stats.json().get("total", "?")
+        health = await http_client.get(f"{API_URL}/api/health")
+        api_ok = health.status_code == 200
+        if health.ok:
+            storage = health.json().get("storage", "?")
+        stats = await _fetch_stats()
     except httpx.HTTPError:
         pass
 
+    embed = discord.Embed(title="SystemPulse Stats", color=PULSE_COLOR if api_ok else 0xC45C5C)
+    embed.add_field(name="API", value="Online" if api_ok else "Offline", inline=True)
+    embed.add_field(name="Storage", value=f"`{storage}`", inline=True)
+    embed.add_field(name="Poll", value=f"`{POLL_INTERVAL}s`", inline=True)
+
+    if stats:
+        embed.add_field(name="Total events", value=str(stats.get("total", 0)), inline=True)
+        embed.add_field(name="Detected", value=str(stats.get("detected", 0)), inline=True)
+        embed.add_field(name="Blocked", value=str(stats.get("blocked", 0)), inline=True)
+
+        modules = stats.get("by_module") or []
+        if modules:
+            lines = []
+            for row in sorted(modules, key=lambda m: m.get("count", 0), reverse=True)[:8]:
+                mid = row.get("module", "?")
+                lines.append(f"`{row.get('count', 0)}` {_module_label(mid)}")
+            embed.add_field(name="Top modules", value="\n".join(lines) or "—", inline=False)
+
     if watch:
         channel = bot.get_channel(watch.channel_id)
-        ch_name = channel.mention if channel else f"`{watch.channel_id}`"
-        guild_line = f"**This server:** watching {ch_name}, cursor `{watch.last_event_id}`"
+        ch = channel.mention if channel else f"`{watch.channel_id}`"
+        embed.add_field(
+            name="This server",
+            value=f"Linked to {ch}\nCursor: `{watch.last_event_id}`",
+            inline=False,
+        )
     else:
-        guild_line = "**This server:** not watching — run `/watch` in your log channel"
+        embed.add_field(name="This server", value="Not linked — use `/pulse link`", inline=False)
+
+    embed.set_footer(text=f"SystemPulse · {len(store.watches)} server(s) linked")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@pulse.command(name="host", description="Show the most recent endpoint that ran a scan")
+@app_commands.guild_only()
+async def pulse_host(interaction: discord.Interaction) -> None:
+    try:
+        events = await _fetch_events(limit=100)
+    except httpx.HTTPError as exc:
+        await interaction.response.send_message(f"API error: {exc}", ephemeral=True)
+        return
+
+    if not events:
+        await interaction.response.send_message("No scans recorded yet.", ephemeral=True)
+        return
+
+    latest = events[0]
+    session_id = latest.get("session_id")
+    session_events = [e for e in events if e.get("session_id") == session_id] if session_id else [latest]
+    session_events.sort(key=lambda e: int(e.get("id", 0)))
+
+    hostname = _event_host(latest)
+    username = _event_user(latest)
+    detected = sum(1 for e in session_events if e.get("detected"))
+    blocked = sum(1 for e in session_events if e.get("blocked"))
+
+    embed = discord.Embed(
+        title=f"Latest endpoint — {hostname}",
+        color=PULSE_COLOR,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="User", value=f"`{username}`", inline=True)
+    embed.add_field(name="Modules run", value=str(len(session_events)), inline=True)
+    embed.add_field(name="Detected / Blocked", value=f"`{detected}` / `{blocked}`", inline=True)
+
+    lines = []
+    for e in session_events[-12:]:
+        mod = e.get("module", "?")
+        status = e.get("status", "?")
+        emoji = MODULE_EMOJI.get(mod, "•")
+        lines.append(f"{emoji} {_module_label(mod)} — `{status}`")
+    embed.add_field(name="Session log", value="\n".join(lines) or "—", inline=False)
+
+    if session_id:
+        embed.set_footer(text=f"Session {str(session_id)[:8]}… · SystemPulse")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@pulse.command(name="recent", description="Show the last few scan events")
+@app_commands.describe(count="How many events to show (1–10)")
+@app_commands.guild_only()
+async def pulse_recent(interaction: discord.Interaction, count: app_commands.Range[int, 1, 10] = 5) -> None:
+    try:
+        events = await _fetch_events(limit=count)
+    except httpx.HTTPError as exc:
+        await interaction.response.send_message(f"API error: {exc}", ephemeral=True)
+        return
+
+    if not events:
+        await interaction.response.send_message("No events yet.", ephemeral=True)
+        return
 
     await interaction.response.send_message(
-        f"**AntiVirusBot Status**\n"
-        f"API: {'🟢' if api_ok else '🔴'} `{API_URL}`\n"
-        f"Total events: `{total}`\n"
-        f"Poll interval: `{POLL_INTERVAL}s`\n"
-        f"Watched servers: `{len(store.watches)}`\n"
-        f"{guild_line}",
+        embeds=[_embed_for_event(e) for e in events[:count]],
         ephemeral=True,
     )
 
 
-@bot.tree.command(name="latest", description="Show the most recent simulation event")
+@pulse.command(name="guide", description="Quick setup guide for SystemPulse Discord logging")
 @app_commands.guild_only()
-async def slash_latest(interaction: discord.Interaction) -> None:
-    try:
-        assert http_client is not None
-        res = await http_client.get(f"{API_URL}/api/events?limit=1")
-        res.raise_for_status()
-        events = res.json()
-        if not events:
-            await interaction.response.send_message("No events yet.", ephemeral=True)
-            return
-        await interaction.response.send_message(embed=_embed_for_event(events[0]))
-    except httpx.HTTPError as exc:
-        await interaction.response.send_message(f"API error: {exc}", ephemeral=True)
+async def pulse_guide(interaction: discord.Interaction) -> None:
+    embed = discord.Embed(
+        title="SystemPulse — Discord setup",
+        description="Log AV research scans from SystemPulse.exe into this server.",
+        color=PULSE_COLOR,
+    )
+    embed.add_field(
+        name="1. Link channel",
+        value="`/pulse link` in the channel where you want live events.",
+        inline=False,
+    )
+    embed.add_field(
+        name="2. Before each scan",
+        value="`/pulse live` — skips old events, only new ones post.",
+        inline=False,
+    )
+    embed.add_field(
+        name="3. Run simulator",
+        value="Right-click **SystemPulse.exe** → Run as administrator → **Run Health Scan**.",
+        inline=False,
+    )
+    embed.add_field(
+        name="Commands",
+        value=(
+            "`/pulse link` — start logging here\n"
+            "`/pulse unlink` — stop logging\n"
+            "`/pulse live` — jump to now\n"
+            "`/pulse stats` — totals & API health\n"
+            "`/pulse host` — latest PC scan summary\n"
+            "`/pulse recent` — last N events\n"
+            "`/pulse guide` — this help"
+        ),
+        inline=False,
+    )
+    embed.set_footer(text="SystemPulse AV Research")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @bot.event

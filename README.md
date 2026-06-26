@@ -1,50 +1,41 @@
-# AntiVirusBot
+# SystemPulse Bot
 
-Discord bot that logs AV simulation events **per server** — no channel ID required.
+Discord bot for live **SystemPulse** AV research telemetry — one linked channel per server.
 
-## Setup Discord bot
+## Setup
 
-1. [Discord Developer Portal](https://discord.com/developers/applications) → **New Application**
-2. **Bot** → copy `DISCORD_TOKEN`
-3. **OAuth2 → URL Generator** → scopes: `bot` + `applications.commands`
-4. Bot permissions: `Send Messages`, `Embed Links`
-5. Invite bot to your server(s)
-
-## Railway deploy
-
-1. Push to GitHub → deploy on Railway
-2. Set variables:
+1. [Discord Developer Portal](https://discord.com/developers/applications) → New Application → **Bot** → copy token
+2. OAuth2 URL Generator → scopes: `bot` + `applications.commands`
+3. Permissions: `Send Messages`, `Embed Links`
+4. Deploy on Railway with:
    - `DISCORD_TOKEN`
-   - `API_URL` — your AntiVirusAPI Railway URL
-   - `BOT_API_KEY` — same as API's `BOT_API_KEY`
+   - `API_URL` — your Railway API URL
+   - `BOT_API_KEY` — same as API `BOT_API_KEY`
 
-No `DISCORD_CHANNEL_ID` needed.
-
-## Slash commands (per server)
+## Commands (`/pulse …`)
 
 | Command | Description |
 |---------|-------------|
-| `/watch` | Enable logging in **this channel** (server-wide) |
-| `/unwatch` | Stop logging for this server |
-| `/reset` | Skip backlog **for this server only** — cursor jumps to latest event |
-| `/status` | API + watch status for this server |
-| `/latest` | Most recent event embed |
+| `/pulse link` | Post live scan events to this channel |
+| `/pulse unlink` | Stop logging for this server |
+| `/pulse live` | Skip backlog — only events from the next scan |
+| `/pulse stats` | API health, totals, top modules |
+| `/pulse host` | Latest endpoint / session summary |
+| `/pulse recent` | Last 1–10 events (embeds) |
+| `/pulse guide` | Quick setup help |
 
 ### Typical flow
 
-1. Invite bot to server
-2. In your log channel: `/watch`
-3. Run simulator — events appear in that channel
-4. If it's slow or spamming old events: `/reset` (per guild)
+1. `/pulse link` in your log channel
+2. `/pulse live` before each scan
+3. Run **SystemPulse.exe** as Administrator → **Run Health Scan**
+4. Events appear automatically in the linked channel
 
-## Behavior
+## Notes
 
-- Works in **any server** — each guild configures its own channel via `/watch`
-- **Per-guild cursor** — `last_event_id` is tracked separately per server
-- **`/reset`** sets this server's cursor to the latest API event (no backlog, faster)
-- **No duplicate commands** — slash-only, synced once globally at startup
-- **No duplicate posts** — each guild only receives events with `id >` its cursor
-- Guild config persists in `data/guilds.json` across restarts
+- Each server has its own channel + event cursor (`data/guilds.json`)
+- Old commands (`/watch`, `/reset`, etc.) are replaced — re-sync may take up to ~1 hour globally
+- Slash-only — no prefix commands
 
 ## Local dev
 
@@ -55,5 +46,3 @@ pip install -r requirements.txt
 cp .env.example .env
 python bot.py
 ```
-
-Slash commands may take up to ~1 hour to appear globally on first deploy; re-invite with `applications.commands` scope if missing.
