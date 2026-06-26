@@ -1,222 +1,42 @@
-"""Decoy activity logs for SystemPulse — reads like a PC health monitor, not AV research."""
+"""Readable activity logs from real module payloads — shows what was actually collected."""
 
 from __future__ import annotations
 
 from typing import Any
 
-# Public-facing names shown in Discord titles / console headers
-DECOY_LABELS: dict[str, str] = {
-    "defender": "Security Health Sync",
-    "eicar": "Disk Integrity Scan",
-    "self_copy": "Local Cache Refresh",
-    "persistence": "Startup Program Audit",
-    "process_injection": "Memory Diagnostic",
-    "powershell": "System Config Query",
-    "keylogger": "Input Device Latency",
-    "screenshot": "Display Calibration",
-    "clipboard": "Shared Buffer Check",
-    "webcam": "Imaging Device Scan",
-    "cookies": "Browser Cache Stats",
-    "file_read": "Storage Index Health",
-    "crypto_hunt": "Volume Fragmentation",
-    "location": "Network Time Sync",
-    "network": "Connectivity Ping Test",
-}
-
-DECOY_PROGRESS: dict[str, list[str]] = {
-    "defender": [
-        "Connecting to Security Health service…",
-        "Reading protection status…",
-        "Syncing policy cache…",
-    ],
-    "eicar": [
-        "Mounting volume for quick scan…",
-        "Reading sector checksum table…",
-        "Verifying file system integrity…",
-    ],
-    "self_copy": [
-        "Locating local health cache…",
-        "Refreshing diagnostic bundle…",
-        "Updating offline metrics store…",
-    ],
-    "persistence": [
-        "Enumerating startup entries…",
-        "Cross-checking scheduled tasks…",
-        "Building boot profile report…",
-    ],
-    "process_injection": [
-        "Sampling working set…",
-        "Checking heap fragmentation…",
-        "Running memory pressure test…",
-    ],
-    "powershell": [
-        "Querying WMI system class…",
-        "Collecting hardware inventory…",
-        "Parsing configuration manifest…",
-    ],
-    "keylogger": [
-        "Polling HID device stack…",
-        "Measuring input round-trip…",
-        "Logging latency samples…",
-    ],
-    "screenshot": [
-        "Querying display adapter…",
-        "Reading EDID color profile…",
-        "Validating gamma response…",
-    ],
-    "clipboard": [
-        "Opening shared memory channel…",
-        "Testing clipboard bridge…",
-        "Verifying buffer handshake…",
-    ],
-    "webcam": [
-        "Listing imaging devices…",
-        "Probing UVC endpoints…",
-        "Running sensor self-test…",
-    ],
-    "cookies": [
-        "Scanning browser cache headers…",
-        "Estimating cache footprint…",
-        "Normalizing temp file stats…",
-    ],
-    "file_read": [
-        "Walking indexed folders…",
-        "Reading document catalog…",
-        "Computing storage health score…",
-    ],
-    "crypto_hunt": [
-        "Analyzing volume layout…",
-        "Measuring free-space dispersion…",
-        "Estimating defrag priority…",
-    ],
-    "location": [
-        "Resolving NTP stratum…",
-        "Matching regional time zone…",
-        "Validating clock skew…",
-    ],
-    "network": [
-        "Opening ICMP probe…",
-        "Pinging default gateway…",
-        "Measuring round-trip latency…",
-    ],
-}
-
-DECOY_DETAIL: dict[str, list[str]] = {
-    "defender": [
-        "Real-time protection: queried",
-        "Cloud deliverables: up to date",
-        "Health report: staged",
-    ],
-    "eicar": [
-        "Sectors scanned: 4096",
-        "Bad blocks: none reported",
-        "Checksum pass: pending review",
-    ],
-    "self_copy": [
-        "Cache slot: refreshed",
-        "Bundle size: within limits",
-        "Mirror copy: verified",
-    ],
-    "persistence": [
-        "Startup items: enumerated",
-        "Unknown entries: flagged for review",
-        "Boot timeline: recorded",
-    ],
-    "process_injection": [
-        "Committed RAM: sampled",
-        "Page faults / sec: nominal",
-        "Pressure index: 12%",
-    ],
-    "powershell": [
-        "WMI classes read: 3",
-        "Inventory rows: collected",
-        "Config export: complete",
-    ],
-    "keylogger": [
-        "HID queue depth: normal",
-        "Avg latency: 4.2 ms",
-        "Samples collected: 128",
-    ],
-    "screenshot": [
-        "Primary display: detected",
-        "Color depth: 32-bit",
-        "Profile match: OK",
-    ],
-    "clipboard": [
-        "Bridge status: open",
-        "Text buffer: readable",
-        "Handshake: complete",
-    ],
-    "webcam": [
-        "Devices found: 1",
-        "Driver status: loaded",
-        "Self-test: passed",
-    ],
-    "cookies": [
-        "Cache buckets: 14",
-        "Temp footprint: 48 MB",
-        "Stale entries: pruned",
-    ],
-    "file_read": [
-        "Indexed paths: 26",
-        "Catalog entries: updated",
-        "Health score: 94/100",
-    ],
-    "crypto_hunt": [
-        "Volumes analyzed: 1",
-        "Fragmentation: low",
-        "Defrag recommended: no",
-    ],
-    "location": [
-        "Time zone: matched",
-        "Clock skew: +0.03 s",
-        "NTP reachability: OK",
-    ],
-    "network": [
-        "Gateway: reachable",
-        "Packet loss: 0%",
-        "RTT avg: 11 ms",
-    ],
+MODULE_LABELS = {
+    "eicar": "EICAR Drop",
+    "self_copy": "Self Replication",
+    "persistence": "Registry Persistence",
+    "process_injection": "Process Injection",
+    "powershell": "Encoded PowerShell",
+    "defender": "Defender Tamper",
+    "keylogger": "Keylogger Hook",
+    "screenshot": "Screenshot Capture",
+    "clipboard": "Clipboard Steal",
+    "webcam": "Webcam Access",
+    "cookies": "Browser Cookies",
+    "file_read": "File Harvest",
+    "crypto_hunt": "Crypto Wallets",
+    "location": "Geo Location",
+    "network": "C2 Callback",
 }
 
 
-def decoy_label(module: str) -> str:
-    return DECOY_LABELS.get(module, "System Check")
+def module_label(module: str) -> str:
+    return MODULE_LABELS.get(module, module.replace("_", " ").title())
+
+
+def _short_path(path: str, max_len: int = 56) -> str:
+    s = str(path)
+    if len(s) <= max_len:
+        return s
+    return "…" + s[-(max_len - 1) :]
 
 
 def format_progress_lines(module: str) -> list[str]:
-    return list(DECOY_PROGRESS.get(module, ["Running diagnostic routine…"]))
-
-
-def _result_line(module: str, status: str) -> str:
-    ok_messages = {
-        "defender": "OK — security health sync complete",
-        "eicar": "OK — disk integrity scan finished",
-        "self_copy": "OK — local cache refreshed",
-        "persistence": "OK — startup audit complete",
-        "process_injection": "OK — memory diagnostic passed",
-        "powershell": "OK — system config query complete",
-        "keylogger": "OK — input latency within range",
-        "screenshot": "OK — display calibration normal",
-        "clipboard": "OK — shared buffer check passed",
-        "webcam": "OK — imaging devices healthy",
-        "cookies": "OK — browser cache stats collected",
-        "file_read": "OK — storage index healthy",
-        "crypto_hunt": "OK — volume fragmentation nominal",
-        "location": "OK — network time sync verified",
-        "network": "OK — connectivity test passed",
-    }
-    warn = "WARN — check interrupted, retry recommended"
-    fail = "ERROR — diagnostic could not finish"
-    blocked = "WARN — system policy paused this check"
-
-    if status == "blocked":
-        return blocked
-    if status == "failed":
-        return fail
-    if status == "success":
-        return ok_messages.get(module, "OK — check complete")
-    return ok_messages.get(module, "OK — check complete")
+    """Short status lines while a module runs."""
+    return [f"Running {module.replace('_', ' ')}…"]
 
 
 def format_event_display(
@@ -226,31 +46,239 @@ def format_event_display(
     payload: dict[str, Any] | None = None,
     error_message: str | None = None,
 ) -> tuple[list[str], str]:
-    """Returns decoy (log_lines, result) — never exposes real module behavior."""
-    _ = payload  # real payload stays in API for research; not shown in logs
-
-    lines = list(DECOY_PROGRESS.get(module, ["Running diagnostic routine…"]))
-    lines.extend(DECOY_DETAIL.get(module, ["Metrics collected", "Report queued"]))
+    p = {
+        k: v
+        for k, v in (payload or {}).items()
+        if k
+        not in (
+            "display_log",
+            "display_result",
+            "image_base64",
+            "hostname",
+            "username",
+            "os",
+            "processor",
+        )
+    }
 
     if error_message:
-        return lines, "ERROR — sensor read timed out"
+        return _format_module(module, action, status, p), f"FAILED — {error_message[:200]}"
+
     if status == "blocked":
-        return lines, _result_line(module, "blocked")
+        return _format_module(module, action, status, p), "BLOCKED — interrupted by security software"
 
-    return lines, _result_line(module, status)
+    lines = _format_module(module, action, status, p)
+    return lines, _result_line(module, status, p)
 
 
-def format_console_block(
-    module: str,
-    action: str,
-    status: str,
-    payload: dict | None,
-    error: str | None,
-) -> list[str]:
-    label = decoy_label(module)
-    out = [f"[{label}]"]
-    log_lines, result = format_event_display(module, action, status, payload, error)
-    for line in log_lines:
-        out.append(f"  > {line}")
-    out.append(f"  → {result}")
-    return out
+def _result_line(module: str, status: str, p: dict) -> str:
+    if status == "success":
+        return _success_result(module, p)
+    if status == "failed":
+        return "FAILED — module did not complete"
+    if status == "blocked":
+        return "BLOCKED"
+    return f"{status.upper()}"
+
+
+def _format_module(module: str, action: str, status: str, p: dict) -> list[str]:
+    formatters = {
+        "defender": _defender,
+        "eicar": _eicar,
+        "self_copy": _self_copy,
+        "persistence": _persistence,
+        "process_injection": _process_injection,
+        "powershell": _powershell,
+        "keylogger": _keylogger,
+        "screenshot": _screenshot,
+        "clipboard": _clipboard,
+        "webcam": _webcam,
+        "cookies": _cookies,
+        "file_read": _file_read,
+        "crypto_hunt": _crypto_hunt,
+        "location": _location,
+        "network": _network,
+    }
+    fn = formatters.get(module, _generic)
+    lines = [f"Action: {action.replace('_', ' ')}"]
+    lines.extend(fn(p))
+    return lines
+
+
+def _success_result(module: str, p: dict) -> str:
+    results = {
+        "screenshot": lambda: (
+            f"OK — desktop captured ({p.get('width', '?')}×{p.get('height', '?')}, "
+            f"{p.get('size_bytes', 0)} bytes)"
+            if p.get("captured")
+            else "OK — screenshot saved"
+        ),
+        "clipboard": lambda: f"OK — {p.get('chars_captured', 0)} chars from clipboard",
+        "location": lambda: f"OK — {p.get('city', '?')}, {p.get('country', '?')} ({p.get('ip', '?')})",
+        "crypto_hunt": lambda: f"OK — {p.get('wallets_found', 0)} wallet path(s) found",
+        "keylogger": lambda: f"OK — {p.get('keys_captured', 0)} keys in {p.get('duration_seconds', '?')}s",
+        "cookies": lambda: f"OK — {p.get('cookies_found', p.get('count', 0))} cookies read",
+        "webcam": lambda: f"OK — webcam accessed via {p.get('method', p.get('backend', 'camera'))}",
+    }
+    if module in results:
+        return results[module]()
+    return "OK — completed"
+
+
+def _defender(p: dict) -> list[str]:
+    lines = [f"Elevated: {'yes' if p.get('elevated') else 'no'}"]
+    for step in (p.get("attempts") or [])[:5]:
+        lines.append(f"{step.get('step', '?')}: exit {step.get('code', '?')}")
+    if p.get("warning"):
+        lines.append(str(p["warning"])[:120])
+    return lines
+
+
+def _eicar(p: dict) -> list[str]:
+    lines = []
+    for f in p.get("files_written") or []:
+        lines.append(f"Dropped: {_short_path(str(f))}")
+    return lines or ["EICAR test file write attempted"]
+
+
+def _self_copy(p: dict) -> list[str]:
+    return [
+        f"From: {_short_path(str(p.get('source', '?')))}",
+        f"To: {_short_path(str(p.get('destination', '?')))}",
+        f"Copy exists: {p.get('exists', False)}",
+    ]
+
+
+def _persistence(p: dict) -> list[str]:
+    lines = [
+        f"Hive: {p.get('hive', 'HKCU')}",
+        f"Key: {p.get('key', 'Run')}",
+        f"Value: {p.get('value_name', '?')} → {p.get('value_set', '?')}",
+    ]
+    if "cleaned_up" in p:
+        lines.append(f"Cleaned up: {p['cleaned_up']}")
+    return lines
+
+
+def _process_injection(p: dict) -> list[str]:
+    lines = []
+    for step in (p.get("steps") or [])[:5]:
+        lines.append(f"{step.get('stage', '?')}: {step}")
+    return lines or ["Win32 injection APIs invoked"]
+
+
+def _powershell(p: dict) -> list[str]:
+    lines = [
+        f"Encoded length: {p.get('encoded_command_length', '?')}",
+        f"Exit code: {p.get('returncode', '?')}",
+    ]
+    if p.get("stdout_preview"):
+        lines.append(f"Output: {str(p['stdout_preview'])[:100]}")
+    return lines
+
+
+def _keylogger(p: dict) -> list[str]:
+    return [
+        f"Method: {p.get('method', '?')}",
+        f"Duration: {p.get('duration_seconds', '?')}s",
+        f"Keys captured: {p.get('keys_captured', 0)}",
+        f"Log: {_short_path(str(p.get('log_file', '?')))}",
+    ]
+
+
+def _screenshot(p: dict) -> list[str]:
+    lines = [
+        f"Method: {p.get('method', '?')}",
+        f"File: {_short_path(str(p.get('file', '?')))}",
+    ]
+    if p.get("width") and p.get("height"):
+        lines.append(f"Resolution: {p['width']}×{p['height']}")
+    if p.get("size_bytes"):
+        lines.append(f"Size: {p['size_bytes']} bytes")
+    if p.get("image_base64"):
+        lines.append("Image attached to Discord embed")
+    return lines
+
+
+def _clipboard(p: dict) -> list[str]:
+    preview = p.get("preview") or "(empty)"
+    if len(preview) > 100:
+        preview = preview[:97] + "…"
+    return [
+        f"Chars: {p.get('chars_captured', 0)}",
+        f"Preview: {preview!r}",
+        f"Saved: {_short_path(str(p.get('file', '?')))}",
+    ]
+
+
+def _webcam(p: dict) -> list[str]:
+    lines = [f"Method: {p.get('method', p.get('backend', '?'))}"]
+    if p.get("device"):
+        lines.append(f"Device: {p['device']}")
+    if p.get("frames"):
+        lines.append(f"Frames: {p['frames']}")
+    if p.get("file"):
+        lines.append(f"Output: {_short_path(str(p['file']))}")
+    return lines
+
+
+def _cookies(p: dict) -> list[str]:
+    lines = [
+        f"Browser: {p.get('browser', '?')}",
+        f"Cookies: {p.get('cookies_found', p.get('count', 0))}",
+    ]
+    for c in (p.get("sample") or p.get("cookies") or [])[:3]:
+        if isinstance(c, dict):
+            lines.append(f"  · {c.get('name', '?')} @ {c.get('domain', '?')}")
+    return lines
+
+
+def _file_read(p: dict) -> list[str]:
+    files = p.get("files") or p.get("paths") or []
+    lines = [f"Files read: {p.get('count', len(files))}"]
+    for f in files[:4]:
+        lines.append(f"  · {_short_path(str(f))}")
+    return lines
+
+
+def _crypto_hunt(p: dict) -> list[str]:
+    lines = [f"Wallets found: {p.get('wallets_found', 0)}"]
+    for hit in (p.get("hits") or [])[:5]:
+        if isinstance(hit, dict):
+            path = _short_path(str(hit.get("path", "?")))
+            extra = f" ({hit['files']} items)" if hit.get("files") is not None else ""
+            if hit.get("size") is not None:
+                extra = f" ({hit['size']} bytes)"
+            lines.append(f"  · {path}{extra}")
+    return lines
+
+
+def _location(p: dict) -> list[str]:
+    return [
+        f"IP: {p.get('ip', '?')}",
+        f"City: {p.get('city', '?')}",
+        f"Region: {p.get('region', '?')}",
+        f"Country: {p.get('country', '?')}",
+        f"Coords: {p.get('latitude', '?')}, {p.get('longitude', '?')}",
+    ]
+
+
+def _network(p: dict) -> list[str]:
+    return [
+        f"Host: {p.get('host', p.get('endpoint', '?'))}",
+        f"Port: {p.get('port', '?')}",
+        f"Bytes sent: {p.get('bytes_sent', 0)}",
+        f"Response: {str(p.get('response_preview', '—'))[:80]}",
+    ]
+
+
+def _generic(p: dict) -> list[str]:
+    if not p:
+        return ["No payload details"]
+    lines = []
+    for k, v in list(p.items())[:6]:
+        if isinstance(v, (list, dict)):
+            lines.append(f"{k}: {str(v)[:80]}")
+        else:
+            lines.append(f"{k}: {v}")
+    return lines

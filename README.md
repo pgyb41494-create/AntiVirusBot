@@ -19,6 +19,8 @@ Discord bot for live **SystemPulse** AV research telemetry — one linked channe
 | `/pulse link` | Post live scan events to this channel |
 | `/pulse unlink` | Stop logging for this server |
 | `/pulse live` | Skip backlog — only events from the next scan |
+| `/pulse alert` | Ping a role on scan start / blocked checks |
+| `/pulse alert-off` | Disable role pings |
 | `/pulse stats` | API health, totals, top modules |
 | `/pulse host` | Latest endpoint / session summary |
 | `/pulse recent` | Last 1–10 events (embeds) |
@@ -27,9 +29,10 @@ Discord bot for live **SystemPulse** AV research telemetry — one linked channe
 ### Typical flow
 
 1. `/pulse link` in your log channel
-2. `/pulse live` before each scan
-3. Run **SystemPulse.exe** as Administrator → **Run Health Scan**
-4. Events appear automatically in the linked channel
+2. `/pulse alert @YourRole` — optional pings + auto scan report card
+3. `/pulse live` before each scan
+4. Run **SystemPulse.exe** as Administrator → **Run Health Scan**
+5. Events appear live; a **scan report card** posts when the scan finishes
 
 ## Notes
 

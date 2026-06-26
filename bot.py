@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
 import json
 import os
 from dataclasses import dataclass, field
@@ -16,7 +18,7 @@ from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 
-from log_display import decoy_label, format_event_display
+from log_display import format_event_display, module_label
 
 load_dotenv()
 
@@ -77,6 +79,8 @@ intents.guilds = True
 http_client: httpx.AsyncClient | None = None
 _commands_synced = False
 _poll_task: asyncio.Task | None = None
+_session_start_alerted: set[str] = set()
+_session_summarized: set[str] = set()
 
 pulse = app_commands.Group(name="pulse", description="SystemPulse AV research telemetry")
 
@@ -85,6 +89,9 @@ pulse = app_commands.Group(name="pulse", description="SystemPulse AV research te
 class GuildWatch:
     channel_id: int
     last_event_id: int = 0
+    alert_role_id: int | None = None
+    alert_on_start: bool = True
+    alert_on_blocked: bool = True
 
 
 @dataclass
@@ -93,7 +100,13 @@ class GuildStore:
 
     def _to_payload(self) -> dict[str, dict]:
         return {
-            gid: {"channel_id": w.channel_id, "last_event_id": w.last_event_id}
+            gid: {
+                "channel_id": w.channel_id,
+                "last_event_id": w.last_event_id,
+                "alert_role_id": w.alert_role_id,
+                "alert_on_start": w.alert_on_start,
+                "alert_on_blocked": w.alert_on_blocked,
+            }
             for gid, w in self.watches.items()
         }
 
@@ -107,6 +120,9 @@ class GuildStore:
             gid: GuildWatch(
                 channel_id=int(data["channel_id"]),
                 last_event_id=int(data.get("last_event_id", 0)),
+                alert_role_id=int(data["alert_role_id"]) if data.get("alert_role_id") else None,
+                alert_on_start=bool(data.get("alert_on_start", True)),
+                alert_on_blocked=bool(data.get("alert_on_blocked", True)),
             )
             for gid, data in payload.items()
         }
@@ -154,6 +170,9 @@ class GuildStore:
                     gid: {
                         "channel_id": w.channel_id,
                         "last_event_id": w.last_event_id,
+                        "alert_role_id": w.alert_role_id,
+                        "alert_on_start": w.alert_on_start,
+                        "alert_on_blocked": w.alert_on_blocked,
                     }
                     for gid, w in self.watches.items()
                 }
@@ -207,7 +226,7 @@ def _guild_id(interaction: discord.Interaction) -> str | None:
 
 
 def _module_label(module: str) -> str:
-    return decoy_label(module)
+    return module_label(module)
 
 
 def _event_host(event: dict) -> str:
@@ -240,7 +259,6 @@ def _parse_ts(iso: str | None) -> datetime:
 def _embed_for_event(event: dict) -> discord.Embed:
     module = event.get("module", "unknown")
     emoji = MODULE_EMOJI.get(module, "📡")
-    label = _module_label(module)
     status = event.get("status", "unknown")
     color = STATUS_COLORS.get(status, PULSE_COLOR)
     hostname = _event_host(event)
@@ -251,7 +269,16 @@ def _embed_for_event(event: dict) -> discord.Embed:
     clean = {
         k: v
         for k, v in payload.items()
-        if k not in ("display_log", "display_result", "hostname", "username", "os", "processor")
+        if k
+        not in (
+            "display_log",
+            "display_result",
+            "image_base64",
+            "hostname",
+            "username",
+            "os",
+            "processor",
+        )
     }
     log_lines = payload.get("display_log")
     result = payload.get("display_result")
@@ -265,7 +292,7 @@ def _embed_for_event(event: dict) -> discord.Embed:
         )
 
     embed = discord.Embed(
-        title=f"{emoji} {label}",
+        title=f"{emoji} {_module_label(module)}",
         description=f"`{action.replace('_', ' ')}`",
         color=color,
         timestamp=_parse_ts(event.get("created_at")),
@@ -296,6 +323,198 @@ def _embed_for_event(event: dict) -> discord.Embed:
 
     embed.set_footer(text="SystemPulse · Live Telemetry")
     return embed
+
+
+def _event_image_b64(event: dict) -> str | None:
+    payload = event.get("payload")
+    if isinstance(payload, dict):
+        b64 = payload.get("image_base64")
+        if isinstance(b64, str) and b64:
+            return b64
+    return None
+
+
+def _role_mention(watch: GuildWatch) -> str | None:
+    if watch.alert_role_id:
+        return f"<@&{watch.alert_role_id}>"
+    return None
+
+
+def _embed_scan_started(event: dict) -> discord.Embed:
+    embed = discord.Embed(
+        title="🩺 SystemPulse — Health Scan Started",
+        description=f"**{_event_host(event)}** · `{_event_user(event)}`",
+        color=PULSE_COLOR,
+        timestamp=_parse_ts(event.get("created_at")),
+    )
+    embed.set_footer(text="SystemPulse · Session opened")
+    return embed
+
+
+def _embed_session_summary(events: list[dict]) -> discord.Embed:
+    ordered = sorted(events, key=lambda e: int(e.get("id", 0)))
+    first = ordered[0]
+    host = _event_host(first)
+    user = _event_user(first)
+    ok = sum(1 for e in ordered if e.get("status") == "success")
+    blocked = sum(
+        1 for e in ordered if e.get("blocked") or e.get("status") == "blocked"
+    )
+    detected = sum(1 for e in ordered if e.get("detected"))
+    failed = sum(1 for e in ordered if e.get("status") == "failed")
+
+    if detected or blocked:
+        color = 0xC49A3A
+    elif failed:
+        color = 0xC45C5C
+    else:
+        color = 0x3D9A6E
+
+    embed = discord.Embed(
+        title="📋 SystemPulse — Scan Report",
+        description=f"**{host}** completed a full health scan\n`{user}`",
+        color=color,
+        timestamp=_parse_ts(ordered[-1].get("created_at")),
+    )
+    embed.add_field(name="Checks run", value=str(len(ordered)), inline=True)
+    embed.add_field(name="Passed", value=str(ok), inline=True)
+    embed.add_field(name="Blocked", value=str(blocked), inline=True)
+    embed.add_field(name="Detected", value=str(detected), inline=True)
+    embed.add_field(name="Failed", value=str(failed), inline=True)
+    embed.add_field(name="Verdict", value=_scan_verdict(ok, blocked, detected, len(ordered)), inline=True)
+
+    lines: list[str] = []
+    for e in ordered:
+        mod = e.get("module", "?")
+        emoji = MODULE_EMOJI.get(mod, "•")
+        payload = e.get("payload") if isinstance(e.get("payload"), dict) else {}
+        result = payload.get("display_result") or e.get("status", "?")
+        if len(str(result)) > 42:
+            result = str(result)[:39] + "…"
+        lines.append(f"{emoji} **{_module_label(mod)}** — {result}")
+
+    report = "\n".join(lines[:16])
+    if len(report) > 1000:
+        report = report[:997] + "…"
+    embed.add_field(name="Check results", value=report or "—", inline=False)
+
+    sid = first.get("session_id")
+    if sid:
+        embed.set_footer(text=f"Session {str(sid)[:8]}… · SystemPulse Summary Card")
+    else:
+        embed.set_footer(text="SystemPulse Summary Card")
+    return embed
+
+
+def _scan_verdict(ok: int, blocked: int, detected: int, total: int) -> str:
+    if total == 0:
+        return "No data"
+    if detected:
+        return "⚠️ AV activity detected"
+    if blocked:
+        return "⚠️ Some checks blocked"
+    if ok == total:
+        return "✅ All checks passed"
+    return "ℹ️ Mixed results"
+
+
+async def _fetch_session(session_id: str) -> dict | None:
+    assert http_client is not None
+    try:
+        res = await http_client.get(
+            f"{API_URL}/api/sessions/{session_id}",
+            headers=_headers(),
+        )
+        if res.status_code == 404:
+            return None
+        res.raise_for_status()
+        return res.json()
+    except httpx.HTTPError:
+        return None
+
+
+async def _fetch_session_events(session_id: str) -> list[dict]:
+    assert http_client is not None
+    res = await http_client.get(
+        f"{API_URL}/api/events",
+        params={"session_id": session_id, "limit": 50},
+    )
+    res.raise_for_status()
+    events: list[dict] = res.json()
+    events.sort(key=lambda e: int(e.get("id", 0)))
+    return events
+
+
+async def _maybe_post_session_summary(
+    channel: discord.abc.Messageable,
+    watch: GuildWatch,
+    session_id: str,
+) -> None:
+    global _session_summarized
+    if not session_id or session_id in _session_summarized:
+        return
+
+    session = await _fetch_session(session_id)
+    if not session or not session.get("finished_at"):
+        return
+
+    events = await _fetch_session_events(session_id)
+    if not events:
+        return
+
+    _session_summarized.add(session_id)
+    summary = _embed_session_summary(events)
+    mention = _role_mention(watch) if watch.alert_role_id else None
+    try:
+        await channel.send(content=mention, embed=summary)
+        print(f"[bot] Posted session summary for {session_id[:8]}…")
+    except discord.HTTPException as exc:
+        print(f"[bot] Summary send failed: {exc}")
+
+
+async def _post_live_event(
+    channel: discord.abc.Messageable,
+    watch: GuildWatch,
+    event: dict,
+) -> None:
+    global _session_start_alerted
+
+    session_id = event.get("session_id")
+    if (
+        session_id
+        and session_id not in _session_start_alerted
+        and watch.alert_role_id
+        and watch.alert_on_start
+    ):
+        _session_start_alerted.add(session_id)
+        try:
+            await channel.send(
+                content=_role_mention(watch),
+                embed=_embed_scan_started(event),
+            )
+        except discord.HTTPException as exc:
+            print(f"[bot] Start alert failed: {exc}")
+
+    embed = _embed_for_event(event)
+    image_b64 = _event_image_b64(event)
+
+    content = None
+    if watch.alert_role_id and watch.alert_on_blocked:
+        if event.get("blocked") or event.get("detected") or event.get("status") == "blocked":
+            content = _role_mention(watch)
+
+    file = None
+    if image_b64 and event.get("module") == "screenshot":
+        try:
+            file = discord.File(
+                io.BytesIO(base64.b64decode(image_b64)),
+                filename="desktop_capture.png",
+            )
+            embed.set_image(url="attachment://desktop_capture.png")
+        except (ValueError, TypeError) as exc:
+            print(f"[bot] Screenshot attach failed: {exc}")
+
+    await channel.send(content=content, embed=embed, file=file)
 
 
 async def _fetch_latest_event_id() -> int:
@@ -356,7 +575,6 @@ async def poll_events() -> None:
 
             for event in events:
                 event_id = int(event.get("id", 0))
-                embed = _embed_for_event(event)
 
                 for guild_id, watch in list(store.watches.items()):
                     if event_id <= watch.last_event_id:
@@ -371,10 +589,22 @@ async def poll_events() -> None:
                         continue
 
                     try:
-                        await channel.send(embed=embed)
+                        await _post_live_event(channel, watch, event)
                         watch.last_event_id = event_id
                     except discord.HTTPException as exc:
                         print(f"[bot] Send failed guild={guild_id}: {exc}")
+
+            batch_sessions = {e.get("session_id") for e in events if e.get("session_id")}
+            for guild_id, watch in list(store.watches.items()):
+                channel = bot.get_channel(watch.channel_id)
+                if channel is None:
+                    guild = bot.get_guild(int(guild_id))
+                    if guild:
+                        channel = guild.get_channel(watch.channel_id)
+                if channel is None:
+                    continue
+                for sid in batch_sessions:
+                    await _maybe_post_session_summary(channel, watch, sid)
 
             await store.persist()
             if events:
@@ -433,6 +663,68 @@ async def pulse_unlink(interaction: discord.Interaction) -> None:
         await interaction.response.send_message("Unlinked — this server will no longer receive events.", ephemeral=True)
     else:
         await interaction.response.send_message("This server is not linked. Use `/pulse link` first.", ephemeral=True)
+
+
+@pulse.command(name="alert", description="Ping a role when scans start or checks get blocked")
+@app_commands.describe(
+    role="Role to @mention",
+    on_start="Ping when a new health scan starts",
+    on_blocked="Ping when a check is blocked or detected",
+)
+@app_commands.guild_only()
+async def pulse_alert(
+    interaction: discord.Interaction,
+    role: discord.Role,
+    on_start: bool = True,
+    on_blocked: bool = True,
+) -> None:
+    gid = _guild_id(interaction)
+    if gid is None:
+        await interaction.response.send_message("Use this in a server.", ephemeral=True)
+        return
+
+    watch = store.watches.get(gid)
+    if not watch:
+        await interaction.response.send_message(
+            "Link a channel first with `/pulse link`.", ephemeral=True
+        )
+        return
+
+    watch.alert_role_id = role.id
+    watch.alert_on_start = on_start
+    watch.alert_on_blocked = on_blocked
+    await store.persist()
+
+    embed = discord.Embed(
+        title="Alerts configured",
+        description=(
+            f"Role {role.mention} will be pinged in <#{watch.channel_id}>.\n\n"
+            f"**On scan start:** {'yes' if on_start else 'no'}\n"
+            f"**On blocked/detected:** {'yes' if on_blocked else 'no'}\n\n"
+            "A **scan report card** posts automatically when a full scan finishes."
+        ),
+        color=PULSE_COLOR,
+    )
+    embed.set_footer(text="SystemPulse")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@pulse.command(name="alert-off", description="Disable role pings for this server")
+@app_commands.guild_only()
+async def pulse_alert_off(interaction: discord.Interaction) -> None:
+    gid = _guild_id(interaction)
+    if gid is None:
+        await interaction.response.send_message("Use this in a server.", ephemeral=True)
+        return
+
+    watch = store.watches.get(gid)
+    if not watch or not watch.alert_role_id:
+        await interaction.response.send_message("No alert role is configured.", ephemeral=True)
+        return
+
+    watch.alert_role_id = None
+    await store.persist()
+    await interaction.response.send_message("Role alerts disabled for this server.", ephemeral=True)
 
 
 @pulse.command(name="live", description="Jump to now — only post events from the next scan onward")
@@ -507,9 +799,17 @@ async def pulse_stats(interaction: discord.Interaction) -> None:
     if watch:
         channel = bot.get_channel(watch.channel_id)
         ch = channel.mention if channel else f"`{watch.channel_id}`"
+        alert_line = "Not set"
+        if watch.alert_role_id and interaction.guild:
+            alert_role = interaction.guild.get_role(watch.alert_role_id)
+            alert_line = (
+                f"{alert_role.mention if alert_role else watch.alert_role_id} "
+                f"(start: {'on' if watch.alert_on_start else 'off'}, "
+                f"blocked: {'on' if watch.alert_on_blocked else 'off'})"
+            )
         embed.add_field(
             name="This server",
-            value=f"Linked to {ch}\nCursor: `{watch.last_event_id}`",
+            value=f"Linked to {ch}\nCursor: `{watch.last_event_id}`\nAlerts: {alert_line}",
             inline=False,
         )
     else:
@@ -614,6 +914,8 @@ async def pulse_guide(interaction: discord.Interaction) -> None:
             "`/pulse link` — start logging here\n"
             "`/pulse unlink` — stop logging\n"
             "`/pulse live` — jump to now\n"
+            "`/pulse alert` — ping a role on start/blocked\n"
+            "`/pulse alert-off` — disable role pings\n"
             "`/pulse stats` — totals & API health\n"
             "`/pulse host` — latest PC scan summary\n"
             "`/pulse recent` — last N events\n"
