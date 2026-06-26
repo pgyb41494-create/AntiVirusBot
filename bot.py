@@ -16,6 +16,8 @@ from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 
+from log_display import format_event_display
+
 load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
@@ -190,10 +192,28 @@ def _embed_for_event(event: dict) -> discord.Embed:
     color = STATUS_COLORS.get(status, PULSE_COLOR)
     hostname = _event_host(event)
     username = _event_user(event)
+    action = event.get("action", "—")
+    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+
+    clean = {
+        k: v
+        for k, v in payload.items()
+        if k not in ("display_log", "display_result", "hostname", "username", "os", "processor")
+    }
+    log_lines = payload.get("display_log")
+    result = payload.get("display_result")
+    if not log_lines or not result:
+        log_lines, result = format_event_display(
+            module,
+            action,
+            status,
+            clean,
+            event.get("error_message"),
+        )
 
     embed = discord.Embed(
         title=f"{emoji} {label}",
-        description=f"**Action:** `{event.get('action', '—')}`",
+        description=f"`{action.replace('_', ' ')}`",
         color=color,
         timestamp=_parse_ts(event.get("created_at")),
     )
@@ -212,15 +232,14 @@ def _embed_for_event(event: dict) -> discord.Embed:
     )
     embed.add_field(name="Event ID", value=str(event.get("id", "?")), inline=True)
 
-    if event.get("error_message"):
-        embed.add_field(name="Error", value=str(event["error_message"])[:500], inline=False)
+    activity = "\n".join(f"> {line}" for line in log_lines[:8])
+    if len(activity) > 900:
+        activity = activity[:897] + "…"
+    embed.add_field(name="Activity log", value=activity or "—", inline=False)
+    embed.add_field(name="Result", value=result[:256], inline=False)
 
-    payload = event.get("payload")
-    if payload and isinstance(payload, dict):
-        extra = {k: v for k, v in payload.items() if k not in ("hostname", "username", "os")}
-        if extra:
-            preview = json.dumps(extra, default=str)[:380]
-            embed.add_field(name="Details", value=f"```json\n{preview}\n```", inline=False)
+    if event.get("error_message"):
+        embed.add_field(name="Error", value=str(event["error_message"])[:300], inline=False)
 
     embed.set_footer(text="SystemPulse · Live Telemetry")
     return embed
@@ -482,9 +501,10 @@ async def pulse_host(interaction: discord.Interaction) -> None:
     lines = []
     for e in session_events[-12:]:
         mod = e.get("module", "?")
-        status = e.get("status", "?")
         emoji = MODULE_EMOJI.get(mod, "•")
-        lines.append(f"{emoji} {_module_label(mod)} — `{status}`")
+        payload = e.get("payload") or {}
+        result = payload.get("display_result") or e.get("status", "?")
+        lines.append(f"{emoji} {_module_label(mod)} — {result}")
     embed.add_field(name="Session log", value="\n".join(lines) or "—", inline=False)
 
     if session_id:
