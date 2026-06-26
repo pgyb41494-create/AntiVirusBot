@@ -33,7 +33,8 @@ Discord bot for live **SystemPulse** AV research telemetry — one linked channe
 
 ## Notes
 
-- Each server has its own channel + event cursor (`data/guilds.json`)
+- Linked channels persist in the **API** (`PUT/GET /api/bot/watches`) — survives bot restarts on Railway
+- `data/guilds.json` is a local backup only
 - Old commands (`/watch`, `/reset`, etc.) are replaced — re-sync may take up to ~1 hour globally
 - Slash-only — no prefix commands
 

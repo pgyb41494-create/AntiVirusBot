@@ -16,7 +16,7 @@ from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 
-from log_display import format_event_display
+from log_display import decoy_label, format_event_display
 
 load_dotenv()
 
@@ -91,33 +91,86 @@ class GuildWatch:
 class GuildStore:
     watches: dict[str, GuildWatch] = field(default_factory=dict)
 
-    def save(self) -> None:
-        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
+    def _to_payload(self) -> dict[str, dict]:
+        return {
             gid: {"channel_id": w.channel_id, "last_event_id": w.last_event_id}
             for gid, w in self.watches.items()
         }
-        CONFIG_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    def _write_local_backup(self) -> None:
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        CONFIG_PATH.write_text(json.dumps(self._to_payload(), indent=2), encoding="utf-8")
 
     @classmethod
-    def load(cls) -> GuildStore:
+    def _from_payload(cls, payload: dict) -> GuildStore:
+        watches = {
+            gid: GuildWatch(
+                channel_id=int(data["channel_id"]),
+                last_event_id=int(data.get("last_event_id", 0)),
+            )
+            for gid, data in payload.items()
+        }
+        return cls(watches=watches)
+
+    @classmethod
+    def load_local(cls) -> GuildStore:
         if not CONFIG_PATH.exists():
             return cls()
         try:
             raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-            watches = {
-                gid: GuildWatch(
-                    channel_id=int(data["channel_id"]),
-                    last_event_id=int(data.get("last_event_id", 0)),
-                )
-                for gid, data in raw.items()
-            }
-            return cls(watches=watches)
+            return cls._from_payload(raw)
         except (json.JSONDecodeError, KeyError, TypeError, ValueError):
             return cls()
 
+    async def load_from_api(self) -> None:
+        assert http_client is not None
+        try:
+            res = await http_client.get(f"{API_URL}/api/bot/watches", headers=_headers())
+            if res.status_code == 404:
+                raise httpx.HTTPStatusError("not found", request=res.request, response=res)
+            res.raise_for_status()
+            data = res.json().get("watches") or {}
+            self.watches = GuildStore._from_payload(data).watches
+            print(f"[bot] Loaded {len(self.watches)} linked guild(s) from API")
+            if not self.watches:
+                local = self.load_local()
+                if local.watches:
+                    self.watches = local.watches
+                    print(f"[bot] Migrated {len(self.watches)} guild(s) from local file to API")
+                    await self.persist()
+            else:
+                self._write_local_backup()
+            return
+        except httpx.HTTPError as exc:
+            print(f"[bot] API watch load failed ({exc}) — using local backup")
+            self.watches = self.load_local().watches
 
-store = GuildStore.load()
+    async def persist(self) -> None:
+        self._write_local_backup()
+        assert http_client is not None
+        try:
+            body = {
+                "watches": {
+                    gid: {
+                        "channel_id": w.channel_id,
+                        "last_event_id": w.last_event_id,
+                    }
+                    for gid, w in self.watches.items()
+                }
+            }
+            res = await http_client.put(
+                f"{API_URL}/api/bot/watches",
+                json=body,
+                headers=_headers(),
+            )
+            if res.status_code == 404:
+                return
+            res.raise_for_status()
+        except httpx.HTTPError as exc:
+            print(f"[bot] API watch save failed ({exc}) — local backup only")
+
+
+store = GuildStore()
 
 
 class SystemPulseBot(commands.Bot):
@@ -154,7 +207,7 @@ def _guild_id(interaction: discord.Interaction) -> str | None:
 
 
 def _module_label(module: str) -> str:
-    return MODULE_LABELS.get(module, module.replace("_", " ").title())
+    return decoy_label(module)
 
 
 def _event_host(event: dict) -> str:
@@ -323,7 +376,7 @@ async def poll_events() -> None:
                     except discord.HTTPException as exc:
                         print(f"[bot] Send failed guild={guild_id}: {exc}")
 
-            store.save()
+            await store.persist()
             if events:
                 print(f"[bot] Distributed {len(events)} event(s) across guilds")
 
@@ -351,7 +404,7 @@ async def pulse_link(interaction: discord.Interaction) -> None:
         channel_id=interaction.channel.id,
         last_event_id=latest,
     )
-    store.save()
+    await store.persist()
 
     embed = discord.Embed(
         title="SystemPulse linked",
@@ -376,7 +429,7 @@ async def pulse_unlink(interaction: discord.Interaction) -> None:
 
     if gid in store.watches:
         del store.watches[gid]
-        store.save()
+        await store.persist()
         await interaction.response.send_message("Unlinked — this server will no longer receive events.", ephemeral=True)
     else:
         await interaction.response.send_message("This server is not linked. Use `/pulse link` first.", ephemeral=True)
@@ -405,7 +458,7 @@ async def pulse_live(interaction: discord.Interaction) -> None:
 
     old_id = watch.last_event_id
     watch.last_event_id = latest
-    store.save()
+    await store.persist()
 
     await interaction.response.send_message(
         f"Live mode updated. Cursor `{old_id}` → `{latest}`.\n"
@@ -575,6 +628,8 @@ async def pulse_guide(interaction: discord.Interaction) -> None:
 @bot.event
 async def on_ready() -> None:
     global _poll_task
+    if http_client is not None:
+        await store.load_from_api()
     print(f"[bot] Logged in as {bot.user} ({len(store.watches)} guild watch(es))")
     if _poll_task is None or _poll_task.done():
         _poll_task = asyncio.create_task(poll_events())
@@ -589,6 +644,7 @@ async def main() -> None:
         raise SystemExit("API_URL is required")
 
     http_client = httpx.AsyncClient(timeout=15.0)
+    await store.load_from_api()
     await bot.start(DISCORD_TOKEN)
 
 
