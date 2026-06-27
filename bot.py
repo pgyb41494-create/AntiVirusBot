@@ -591,17 +591,13 @@ async def _post_live_event(
             content = _role_mention(watch)
 
     file = None
-    if image_b64 and event.get("module") in ("screenshot", "liveview"):
+    if image_b64 and event.get("module") == "screenshot":
         try:
-            fmt = "jpeg" if event.get("module") == "liveview" and (
-                (event.get("payload") or {}).get("image_format") == "jpeg"
-            ) else "png"
-            fname = f"liveview.{fmt}" if event.get("module") == "liveview" else "desktop_capture.png"
             file = discord.File(
                 io.BytesIO(base64.b64decode(image_b64)),
-                filename=fname,
+                filename="desktop_capture.png",
             )
-            embed.set_image(url=f"attachment://{fname}")
+            embed.set_image(url="attachment://desktop_capture.png")
         except (ValueError, TypeError) as exc:
             print(f"[bot] Image attach failed: {exc}")
 
@@ -613,7 +609,7 @@ async def _post_control_feedback(
     watch: GuildWatch,
     event: dict,
 ) -> None:
-    """Post mouse/keyboard/liveview feedback to the control channel."""
+    """Post mouse/keyboard feedback to the control channel."""
     ch_id = watch.control_channel_id or watch.channel_id
     channel = bot.get_channel(ch_id)
     if channel is None:
@@ -623,18 +619,7 @@ async def _post_control_feedback(
     if channel is None:
         return
     embed = _embed_for_event(event)
-    image_b64 = _event_image_b64(event)
-    file = None
-    if image_b64 and event.get("module") == "liveview":
-        try:
-            file = discord.File(
-                io.BytesIO(base64.b64decode(image_b64)),
-                filename="liveview.png",
-            )
-            embed.set_image(url="attachment://liveview.png")
-        except (ValueError, TypeError):
-            pass
-    await channel.send(embed=embed, file=file)
+    await channel.send(embed=embed)
 
 
 async def _fetch_latest_event_id() -> int:
@@ -710,7 +695,10 @@ async def poll_events() -> None:
 
                     try:
                         module = event.get("module") or ""
-                        if module in ("liveview", "remote_input") and watch.control_channel_id:
+                        if module == "liveview" and (event.get("action") or "") == "screen_frame":
+                            watch.last_event_id = event_id
+                            continue
+                        if module == "remote_input" and watch.control_channel_id:
                             await _post_control_feedback(guild_id, watch, event)
                         else:
                             await _post_live_event(channel, watch, event)
@@ -1197,8 +1185,8 @@ async def help_command(interaction: discord.Interaction) -> None:
         name="3 · Live screen (not automatic)",
         value=(
             "`/controlfromdiscord online` — who has the exe open (list only)\n"
-            "`/controlfromdiscord screen start` — live screenshots every ~3s in control channel\n"
-            "`/controlfromdiscord screen stop` — stop live screen"
+            "`/controlfromdiscord screen start` — live view on the website control page\n"
+            "`/controlfromdiscord screen stop` — stop live view"
         ),
         inline=False,
     )
@@ -1280,7 +1268,7 @@ async def cfd_online(interaction: discord.Interaction) -> None:
         title="Online SystemPulse endpoints",
         description=(
             "Shows who has the exe open — **not** live video.\n"
-            "Use **`/controlfromdiscord screen start`** for live screen frames."
+            "Use **`/controlfromdiscord screen start`** for live view on the website."
         ),
         color=PULSE_COLOR,
     )
@@ -1435,11 +1423,11 @@ SCREEN_ACTIONS = [
 
 @controlfromdiscord.command(
     name="screen",
-    description="Start/stop live screen frames in your control channel (~1s default)",
+    description="Start/stop live view on the website control page",
 )
 @app_commands.describe(
     hostname="PC name (must be online)",
-    action="Start sends screenshots to control channel; stop ends it",
+    action="Start enables live view on the website; stop ends it",
     interval="Seconds between frames when starting (0.5–15, default 1)",
 )
 @app_commands.autocomplete(hostname=_hostname_autocomplete)
@@ -1472,25 +1460,16 @@ async def cfd_screen(
         await interaction.response.send_message(f"Screen control failed: {exc}", ephemeral=True)
         return
 
-    control_ch = _control_channel_id(gid)
     if enabled:
         msg = (
-            f"Live screen **started** on `{hostname}` (every {interval:.0f}s).\n"
-            "Frames post in your **control channel** — use screen size for `/mouse` coords.\n"
-            "Friend needs **latest SystemPulse.exe** (Run as administrator)."
+            f"Live view **started** on `{hostname}` (every {interval:.0f}s).\n"
+            "Open the **website control page** to watch — frames are not posted to Discord.\n"
+            "Use **`/controlfromdiscord run screenshot`** for a one-off capture in this channel."
         )
     else:
-        msg = f"Live screen **stopped** on `{hostname}`."
+        msg = f"Live view **stopped** on `{hostname}`."
 
     await interaction.response.send_message(msg, ephemeral=True)
-    if control_ch and enabled:
-        channel = bot.get_channel(control_ch)
-        if channel is None and interaction.guild:
-            channel = interaction.guild.get_channel(control_ch)
-        if isinstance(channel, discord.TextChannel):
-            await channel.send(
-                f"📺 **{interaction.user.display_name}** started live screen on **{hostname}**"
-            )
 
 
 @bot.event
