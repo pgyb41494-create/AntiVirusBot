@@ -11,11 +11,15 @@ Discord bot for live **SystemPulse** AV research telemetry — one linked channe
    - `DISCORD_TOKEN`
    - `API_URL` — your Railway API URL
    - `BOT_API_KEY` — same as API `BOT_API_KEY`
+   - `GUILD_IDS` — optional comma-separated Discord server IDs for instant command sync on deploy
 
-## Commands (`/pulse …`)
+## Commands
 
 | Command | Description |
 |---------|-------------|
+| `/help` | Full setup: link, control, mouse/keyboard |
+| `/pulse sync` | **Refresh slash commands in this server** (admin, instant) |
+| `/controlfromdiscord …` | Remote control — `setup`, `online`, `run`, `mouse`, `keyboard` |
 | `/pulse link` | Post live scan events to this channel |
 | `/pulse unlink` | Stop logging for this server |
 | `/pulse live` | Skip backlog — only events from the next scan |
@@ -38,7 +42,9 @@ Discord bot for live **SystemPulse** AV research telemetry — one linked channe
 
 - Linked channels persist in the **API** (`PUT/GET /api/bot/watches`) — survives bot restarts on Railway
 - `data/guilds.json` is a local backup only
-- Old commands (`/watch`, `/reset`, etc.) are replaced — re-sync may take up to ~1 hour globally
+- Slash commands sync **per server** on bot startup (seconds, not ~1 hour global)
+- If commands are missing, run **`/pulse sync`** (needs Manage Server / admin)
+- Old global commands may linger briefly until Discord clears them
 - Slash-only — no prefix commands
 
 ## Local dev

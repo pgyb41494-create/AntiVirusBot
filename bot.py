@@ -27,6 +27,11 @@ API_URL = os.getenv("API_URL", "").rstrip("/")
 BOT_API_KEY = os.getenv("BOT_API_KEY", "")
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "2"))
 CONFIG_PATH = Path(__file__).parent / "data" / "guilds.json"
+EXTRA_GUILD_IDS = [
+    int(g.strip())
+    for g in os.getenv("GUILD_IDS", "").split(",")
+    if g.strip().isdigit()
+]
 
 PULSE_COLOR = 0x3D6FA8
 
@@ -212,6 +217,39 @@ class GuildStore:
 store = GuildStore()
 
 
+async def sync_guild_commands(guild: discord.Object | discord.Guild) -> int:
+    """Push slash commands to one guild — updates in seconds, not ~1 hour."""
+    bot.tree.copy_global_to(guild=guild)
+    synced = await bot.tree.sync(guild=guild)
+    label = getattr(guild, "name", None) or getattr(guild, "id", guild)
+    print(f"[bot] Guild sync {label}: {len(synced)} command(s)")
+    return len(synced)
+
+
+async def sync_all_guild_commands() -> int:
+    """Sync slash commands to every guild the bot is in (+ optional GUILD_IDS env)."""
+    total = 0
+    seen: set[int] = set()
+
+    for guild in bot.guilds:
+        try:
+            total += await sync_guild_commands(guild)
+            seen.add(guild.id)
+        except discord.HTTPException as exc:
+            print(f"[bot] Guild sync failed {guild.id}: {exc}")
+
+    for gid in EXTRA_GUILD_IDS:
+        if gid in seen:
+            continue
+        try:
+            total += await sync_guild_commands(discord.Object(id=gid))
+        except discord.HTTPException as exc:
+            print(f"[bot] Env guild sync failed {gid}: {exc}")
+
+    print(f"[bot] Per-guild command sync complete ({total} registrations)")
+    return total
+
+
 class SystemPulseBot(commands.Bot):
     def __init__(self) -> None:
         super().__init__(command_prefix=None, intents=intents)
@@ -225,9 +263,8 @@ class SystemPulseBot(commands.Bot):
         global _commands_synced
         if _commands_synced:
             return
-        synced = await self.tree.sync()
+        await sync_all_guild_commands()
         _commands_synced = True
-        print(f"[bot] Synced {len(synced)} slash command(s) globally")
 
 
 bot = SystemPulseBot()
@@ -637,6 +674,25 @@ async def poll_events() -> None:
         await asyncio.sleep(POLL_INTERVAL)
 
 
+@pulse.command(name="sync", description="Refresh slash commands in this server (instant)")
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def pulse_sync(interaction: discord.Interaction) -> None:
+    if interaction.guild is None:
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        count = await sync_guild_commands(interaction.guild)
+    except discord.HTTPException as exc:
+        await interaction.followup.send(f"Sync failed: {exc}", ephemeral=True)
+        return
+    await interaction.followup.send(
+        f"Synced **{count}** command group(s) to this server.\n"
+        "Try `/help`, `/controlfromdiscord`, and `/pulse` now (may take ~5–10 seconds to appear).",
+        ephemeral=True,
+    )
+
+
 @pulse.command(name="link", description="Start posting live scan events to this channel")
 @app_commands.guild_only()
 async def pulse_link(interaction: discord.Interaction) -> None:
@@ -937,6 +993,7 @@ async def pulse_guide(interaction: discord.Interaction) -> None:
             "`/pulse live` — jump to now\n"
             "`/pulse alert` — ping a role on start/blocked\n"
             "`/pulse alert-off` — disable role pings\n"
+            "`/pulse sync` — refresh slash commands in this server\n"
             "`/pulse stats` — totals & API health\n"
             "`/pulse host` — latest PC scan summary\n"
             "`/pulse recent` — last N events\n"
@@ -947,7 +1004,8 @@ async def pulse_guide(interaction: discord.Interaction) -> None:
             "`/controlfromdiscord run` — trigger one module on a PC\n"
             "`/controlfromdiscord mouse` — move/click remotely\n"
             "`/controlfromdiscord keyboard` — type or press keys\n"
-            "`/help` — full setup guide"
+            "`/help` — full setup guide\n"
+            "`/pulse sync` — refresh commands if new ones missing"
         ),
         inline=False,
     )
@@ -1100,6 +1158,14 @@ async def help_command(interaction: discord.Interaction) -> None:
             "`/controlfromdiscord run` — trigger module\n"
             "`/controlfromdiscord mouse` — mouse control\n"
             "`/controlfromdiscord keyboard` — keyboard control"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Commands not showing?",
+        value=(
+            "Run **`/pulse sync`** (admin) in this server — commands update in seconds.\n"
+            "Or set `GUILD_IDS=your_server_id` on Railway and redeploy the bot."
         ),
         inline=False,
     )
@@ -1266,6 +1332,14 @@ async def cfd_keyboard(
         payload=payload,
         summary=summary,
     )
+
+
+@bot.event
+async def on_guild_join(guild: discord.Guild) -> None:
+    try:
+        await sync_guild_commands(guild)
+    except discord.HTTPException as exc:
+        print(f"[bot] Sync on join failed {guild.id}: {exc}")
 
 
 @bot.event
