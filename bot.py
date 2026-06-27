@@ -593,7 +593,10 @@ async def _post_live_event(
     file = None
     if image_b64 and event.get("module") in ("screenshot", "liveview"):
         try:
-            fname = "liveview.png" if event.get("module") == "liveview" else "desktop_capture.png"
+            fmt = "jpeg" if event.get("module") == "liveview" and (
+                (event.get("payload") or {}).get("image_format") == "jpeg"
+            ) else "png"
+            fname = f"liveview.{fmt}" if event.get("module") == "liveview" else "desktop_capture.png"
             file = discord.File(
                 io.BytesIO(base64.b64decode(image_b64)),
                 filename=fname,
@@ -1418,12 +1421,12 @@ SCREEN_ACTIONS = [
 
 @controlfromdiscord.command(
     name="screen",
-    description="Start/stop live screen frames in your control channel (~every 3s)",
+    description="Start/stop live screen frames in your control channel (~1s default)",
 )
 @app_commands.describe(
     hostname="PC name (must be online)",
     action="Start sends screenshots to control channel; stop ends it",
-    interval="Seconds between frames when starting (2–15)",
+    interval="Seconds between frames when starting (0.5–15, default 1)",
 )
 @app_commands.autocomplete(hostname=_hostname_autocomplete)
 @app_commands.choices(action=SCREEN_ACTIONS)
@@ -1432,7 +1435,7 @@ async def cfd_screen(
     interaction: discord.Interaction,
     hostname: str,
     action: str,
-    interval: app_commands.Range[float, 2, 15] = 3,
+    interval: app_commands.Range[float, 0.5, 15] = 1,
 ) -> None:
     gid = _guild_id(interaction)
     if not gid:
