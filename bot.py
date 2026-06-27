@@ -1435,7 +1435,7 @@ async def cfd_screen(
     interaction: discord.Interaction,
     hostname: str,
     action: str,
-    interval: app_commands.Range[float, 0.5, 15] = 1,
+    interval: app_commands.Range[float, 0.5, 15.0] = 1.0,
 ) -> None:
     gid = _guild_id(interaction)
     if not gid:
