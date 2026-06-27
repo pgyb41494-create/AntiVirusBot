@@ -217,50 +217,66 @@ class GuildStore:
 store = GuildStore()
 
 
-async def clear_global_slash_commands() -> None:
-    """Remove global slash commands on Discord (leaves in-memory tree for guild copy)."""
+def _guild_numeric_id(guild: discord.Object | discord.Guild) -> int:
+    return int(guild.id)
+
+
+async def _wipe_global_commands() -> None:
     if not bot.application_id:
         return
-    try:
-        await bot.http.bulk_upsert_global_commands(bot.application_id, [])
-        print("[bot] Cleared global slash commands on Discord")
-    except discord.HTTPException as exc:
-        print(f"[bot] Global command clear failed: {exc}")
+    await bot.http.bulk_upsert_global_commands(bot.application_id, [])
+    bot.tree.clear_commands(guild=None)
+    print("[bot] Wiped global slash commands")
 
 
-async def sync_guild_commands(guild: discord.Object | discord.Guild) -> int:
-    """Replace guild slash commands — clears old entries first to avoid duplicates."""
-    bot.tree.clear_commands(guild=guild)
-    bot.tree.copy_global_to(guild=guild)
-    synced = await bot.tree.sync(guild=guild)
-    label = getattr(guild, "name", None) or getattr(guild, "id", guild)
-    print(f"[bot] Guild sync {label}: {len(synced)} command(s)")
+async def _wipe_guild_commands(guild_id: int) -> None:
+    if not bot.application_id:
+        return
+    await bot.http.bulk_upsert_guild_commands(bot.application_id, guild_id, [])
+
+
+async def install_guild_commands(guild: discord.Object | discord.Guild) -> int:
+    """Guild-only commands — wipe Discord + local tree, then register once."""
+    if not bot.application_id:
+        return 0
+
+    gid = _guild_numeric_id(guild)
+    await _wipe_guild_commands(gid)
+
+    guild_ref = guild if isinstance(guild, discord.Guild) else discord.Object(id=gid)
+    bot.tree.clear_commands(guild=guild_ref)
+    bot.tree.add_command(pulse, guild=guild_ref)
+    bot.tree.add_command(controlfromdiscord, guild=guild_ref)
+    bot.tree.add_command(help_command, guild=guild_ref)
+
+    synced = await bot.tree.sync(guild=guild_ref)
+    label = getattr(guild, "name", None) or gid
+    print(f"[bot] Installed {len(synced)} command(s) on guild {label}")
     return len(synced)
 
 
 async def sync_all_guild_commands() -> int:
-    """Guild-only commands: wipe globals, then sync each server."""
-    await clear_global_slash_commands()
+    await _wipe_global_commands()
 
     total = 0
     seen: set[int] = set()
 
     for guild in bot.guilds:
         try:
-            total += await sync_guild_commands(guild)
+            total += await install_guild_commands(guild)
             seen.add(guild.id)
         except discord.HTTPException as exc:
-            print(f"[bot] Guild sync failed {guild.id}: {exc}")
+            print(f"[bot] Guild install failed {guild.id}: {exc}")
 
     for gid in EXTRA_GUILD_IDS:
         if gid in seen:
             continue
         try:
-            total += await sync_guild_commands(discord.Object(id=gid))
+            total += await install_guild_commands(discord.Object(id=gid))
         except discord.HTTPException as exc:
-            print(f"[bot] Env guild sync failed {gid}: {exc}")
+            print(f"[bot] Env guild install failed {gid}: {exc}")
 
-    print(f"[bot] Per-guild command sync complete ({total} registrations)")
+    print(f"[bot] Command install complete ({total} top-level commands across guilds)")
     return total
 
 
@@ -269,8 +285,7 @@ class SystemPulseBot(commands.Bot):
         super().__init__(command_prefix=None, intents=intents)
 
     async def setup_hook(self) -> None:
-        self.tree.add_command(pulse)
-        self.tree.add_command(controlfromdiscord)
+        # Commands are installed per-guild only (see install_guild_commands).
         self.add_listener(self._on_ready_sync, "on_ready")
 
     async def _on_ready_sync(self) -> None:
@@ -696,15 +711,15 @@ async def pulse_sync(interaction: discord.Interaction) -> None:
         return
     await interaction.response.defer(ephemeral=True)
     try:
-        await clear_global_slash_commands()
-        count = await sync_guild_commands(interaction.guild)
+        await _wipe_global_commands()
+        count = await install_guild_commands(interaction.guild)
     except discord.HTTPException as exc:
         await interaction.followup.send(f"Sync failed: {exc}", ephemeral=True)
         return
     await interaction.followup.send(
-        f"Synced **{count}** command(s) to this server (duplicates cleared).\n"
-        "Wait ~10 seconds, then type `/` — you should see one `/help`, one `/pulse`, "
-        "and one `/controlfromdiscord`.",
+        f"Reinstalled **{count}** top-level command(s) on this server.\n"
+        "**If you still see doubles:** fully quit and reopen Discord (Ctrl+R is not enough), "
+        "then type `/` again. You should see exactly one `/help`, `/pulse`, and `/controlfromdiscord`.",
         ephemeral=True,
     )
 
@@ -1116,7 +1131,7 @@ async def _queue_command(
     return cmd
 
 
-@bot.tree.command(name="help", description="SystemPulse setup, logging, and remote control guide")
+@app_commands.command(name="help", description="SystemPulse setup, logging, and remote control guide")
 @app_commands.guild_only()
 async def help_command(interaction: discord.Interaction) -> None:
     embed = discord.Embed(
@@ -1353,7 +1368,7 @@ async def cfd_keyboard(
 @bot.event
 async def on_guild_join(guild: discord.Guild) -> None:
     try:
-        await sync_guild_commands(guild)
+        await install_guild_commands(guild)
     except discord.HTTPException as exc:
         print(f"[bot] Sync on join failed {guild.id}: {exc}")
 
