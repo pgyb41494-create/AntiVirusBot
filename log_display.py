@@ -227,9 +227,16 @@ def _cookies(p: dict) -> list[str]:
         f"Browser: {p.get('browser', '?')}",
         f"Cookies: {p.get('cookies_found', p.get('count', 0))}",
     ]
-    for c in (p.get("sample") or p.get("cookies") or [])[:3]:
+    for c in (p.get("sample") or p.get("cookies") or [])[:5]:
         if isinstance(c, dict):
             lines.append(f"  · {c.get('name', '?')} @ {c.get('domain', '?')}")
+    logins = p.get("login_databases") or []
+    if logins:
+        lines.append(f"Password DBs: {len(logins)}")
+        for ldb in logins[:4]:
+            if isinstance(ldb, dict):
+                path = _short_path(str(ldb.get("path", "?")))
+                lines.append(f"  · {ldb.get('browser', '?')}: {path}")
     return lines
 
 

