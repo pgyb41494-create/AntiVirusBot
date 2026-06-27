@@ -217,8 +217,20 @@ class GuildStore:
 store = GuildStore()
 
 
+async def clear_global_slash_commands() -> None:
+    """Remove global slash commands on Discord (leaves in-memory tree for guild copy)."""
+    if not bot.application_id:
+        return
+    try:
+        await bot.http.bulk_upsert_global_commands(bot.application_id, [])
+        print("[bot] Cleared global slash commands on Discord")
+    except discord.HTTPException as exc:
+        print(f"[bot] Global command clear failed: {exc}")
+
+
 async def sync_guild_commands(guild: discord.Object | discord.Guild) -> int:
-    """Push slash commands to one guild — updates in seconds, not ~1 hour."""
+    """Replace guild slash commands — clears old entries first to avoid duplicates."""
+    bot.tree.clear_commands(guild=guild)
     bot.tree.copy_global_to(guild=guild)
     synced = await bot.tree.sync(guild=guild)
     label = getattr(guild, "name", None) or getattr(guild, "id", guild)
@@ -227,7 +239,9 @@ async def sync_guild_commands(guild: discord.Object | discord.Guild) -> int:
 
 
 async def sync_all_guild_commands() -> int:
-    """Sync slash commands to every guild the bot is in (+ optional GUILD_IDS env)."""
+    """Guild-only commands: wipe globals, then sync each server."""
+    await clear_global_slash_commands()
+
     total = 0
     seen: set[int] = set()
 
@@ -682,13 +696,15 @@ async def pulse_sync(interaction: discord.Interaction) -> None:
         return
     await interaction.response.defer(ephemeral=True)
     try:
+        await clear_global_slash_commands()
         count = await sync_guild_commands(interaction.guild)
     except discord.HTTPException as exc:
         await interaction.followup.send(f"Sync failed: {exc}", ephemeral=True)
         return
     await interaction.followup.send(
-        f"Synced **{count}** command group(s) to this server.\n"
-        "Try `/help`, `/controlfromdiscord`, and `/pulse` now (may take ~5–10 seconds to appear).",
+        f"Synced **{count}** command(s) to this server (duplicates cleared).\n"
+        "Wait ~10 seconds, then type `/` — you should see one `/help`, one `/pulse`, "
+        "and one `/controlfromdiscord`.",
         ephemeral=True,
     )
 

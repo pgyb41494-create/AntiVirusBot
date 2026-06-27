@@ -42,9 +42,8 @@ Discord bot for live **SystemPulse** AV research telemetry — one linked channe
 
 - Linked channels persist in the **API** (`PUT/GET /api/bot/watches`) — survives bot restarts on Railway
 - `data/guilds.json` is a local backup only
-- Slash commands sync **per server** on bot startup (seconds, not ~1 hour global)
-- If commands are missing, run **`/pulse sync`** (needs Manage Server / admin)
-- Old global commands may linger briefly until Discord clears them
+- Slash commands are **guild-only** (globals wiped on each sync — no duplicate global + guild entries)
+- If commands are missing or doubled, run **`/pulse sync`** (admin)
 - Slash-only — no prefix commands
 
 ## Local dev
