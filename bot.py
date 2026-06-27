@@ -1070,8 +1070,8 @@ async def pulse_guide(interaction: discord.Interaction) -> None:
             "`/controlfromdiscord setup` — set control channel\n"
             "`/controlfromdiscord online` — who's running the exe\n"
             "`/controlfromdiscord run` — trigger one module on a PC\n"
-            "`/controlfromdiscord mouse` — move/click remotely\n"
-            "`/controlfromdiscord keyboard` — type or press keys\n"
+            "`/controlfromdiscord mouse` — move, click, scroll\n"
+            "`/controlfromdiscord keyboard` — type, key, or combo (e.g. win+d)\n"
             "`/help` — full setup guide\n"
             "`/pulse sync` — refresh commands if new ones missing"
         ),
@@ -1205,8 +1205,8 @@ async def help_command(interaction: discord.Interaction) -> None:
     embed.add_field(
         name="4 · Mouse & keyboard",
         value=(
-            "`/controlfromdiscord mouse` — click at x,y (use screen size from `/online`)\n"
-            "`/controlfromdiscord keyboard` — type text or press a key\n"
+            "`/controlfromdiscord mouse` — click, scroll up/down at x,y\n"
+            "`/controlfromdiscord keyboard` — text, key (win, f1…), or combo `win+d`\n"
             "Friend must use **latest exe** + **Run as administrator**"
         ),
         inline=False,
@@ -1329,6 +1329,8 @@ MOUSE_ACTION_CHOICES = [
     app_commands.Choice(name="Left click", value="click"),
     app_commands.Choice(name="Right click", value="rightclick"),
     app_commands.Choice(name="Double click", value="doubleclick"),
+    app_commands.Choice(name="Scroll up", value="scrollup"),
+    app_commands.Choice(name="Scroll down", value="scrolldown"),
 ]
 
 
@@ -1358,6 +1360,12 @@ async def cfd_mouse(
     elif action == "doubleclick":
         payload = {"action": "click", "x": x, "y": y, "button": "left", "clicks": 2}
         summary = f"double click → ({x}, {y})"
+    elif action == "scrollup":
+        payload = {"action": "scroll", "x": x, "y": y, "delta": 120}
+        summary = f"scroll up → ({x}, {y})"
+    elif action == "scrolldown":
+        payload = {"action": "scroll", "x": x, "y": y, "delta": -120}
+        summary = f"scroll down → ({x}, {y})"
     else:
         payload = {"action": "click", "x": x, "y": y, "button": "left", "clicks": 1}
         summary = f"left click → ({x}, {y})"
@@ -1375,7 +1383,7 @@ async def cfd_mouse(
 @app_commands.describe(
     hostname="PC name (must be online)",
     text="Text to type (leave empty if using key)",
-    key="Single key: enter, tab, esc, space, backspace, up, down, …",
+    key="Single key: win, enter, tab, esc, f1, ctrl, … or combo like win+d",
 )
 @app_commands.autocomplete(hostname=_hostname_autocomplete)
 @app_commands.guild_only()
@@ -1401,8 +1409,14 @@ async def cfd_keyboard(
         preview = text if len(text) <= 40 else text[:37] + "…"
         summary = f"keyboard type `{preview}`"
     else:
-        payload = {"action": "key", "key": key or ""}
-        summary = f"keyboard key `{key}`"
+        raw = (key or "").strip()
+        if "+" in raw:
+            parts = [p.strip() for p in raw.split("+") if p.strip()]
+            payload = {"action": "combo", "keys": parts}
+            summary = f"keyboard combo `{raw}`"
+        else:
+            payload = {"action": "key", "key": raw.lower()}
+            summary = f"keyboard key `{raw}`"
 
     await _queue_command(
         interaction,
@@ -1435,7 +1449,7 @@ async def cfd_screen(
     interaction: discord.Interaction,
     hostname: str,
     action: str,
-    interval: app_commands.Range[float, 0.5, 15.0] = 1.0,
+    interval: app_commands.Range[float, 0.12, 15.0] = 0.25,
 ) -> None:
     gid = _guild_id(interaction)
     if not gid:
