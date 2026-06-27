@@ -26,6 +26,9 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
 API_URL = os.getenv("API_URL", "").rstrip("/")
 BOT_API_KEY = os.getenv("BOT_API_KEY", "")
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "2"))
+PRESENCE_POLL_INTERVAL = float(os.getenv("PRESENCE_POLL_INTERVAL", "45"))
+ONLINE_WITHIN_MINUTES = 3
+OFFLINE_AFTER_MINUTES = 5
 CONFIG_PATH = Path(__file__).parent / "data" / "guilds.json"
 EXTRA_GUILD_IDS = [
     int(g.strip())
@@ -84,8 +87,11 @@ intents.guilds = True
 http_client: httpx.AsyncClient | None = None
 _commands_synced = False
 _poll_task: asyncio.Task | None = None
+_presence_task: asyncio.Task | None = None
 _session_start_alerted: set[str] = set()
 _session_summarized: set[str] = set()
+_presence_state: dict[str, dict[str, str]] = {}
+_presence_bootstrapped: set[str] = set()
 
 pulse = app_commands.Group(name="pulse", description="SystemPulse AV research telemetry")
 
@@ -111,6 +117,8 @@ class GuildWatch:
     alert_role_id: int | None = None
     alert_on_start: bool = True
     alert_on_blocked: bool = True
+    alert_on_online: bool = True
+    alert_on_offline: bool = True
     control_channel_id: int | None = None
 
 
@@ -126,6 +134,8 @@ class GuildStore:
                 "alert_role_id": w.alert_role_id,
                 "alert_on_start": w.alert_on_start,
                 "alert_on_blocked": w.alert_on_blocked,
+                "alert_on_online": w.alert_on_online,
+                "alert_on_offline": w.alert_on_offline,
                 "control_channel_id": w.control_channel_id,
             }
             for gid, w in self.watches.items()
@@ -144,6 +154,8 @@ class GuildStore:
                 alert_role_id=int(data["alert_role_id"]) if data.get("alert_role_id") else None,
                 alert_on_start=bool(data.get("alert_on_start", True)),
                 alert_on_blocked=bool(data.get("alert_on_blocked", True)),
+                alert_on_online=bool(data.get("alert_on_online", True)),
+                alert_on_offline=bool(data.get("alert_on_offline", True)),
                 control_channel_id=int(data["control_channel_id"])
                 if data.get("control_channel_id")
                 else None,
@@ -197,6 +209,8 @@ class GuildStore:
                         "alert_role_id": w.alert_role_id,
                         "alert_on_start": w.alert_on_start,
                         "alert_on_blocked": w.alert_on_blocked,
+                        "alert_on_online": w.alert_on_online,
+                        "alert_on_offline": w.alert_on_offline,
                         "control_channel_id": w.control_channel_id,
                     }
                     for gid, w in self.watches.items()
@@ -425,6 +439,87 @@ def _role_mention(watch: GuildWatch) -> str | None:
     if watch.alert_role_id:
         return f"<@&{watch.alert_role_id}>"
     return None
+
+
+def _alert_channel(watch: GuildWatch) -> int:
+    return watch.control_channel_id or watch.channel_id
+
+
+async def _resolve_text_channel(guild_id: str, channel_id: int) -> discord.TextChannel | None:
+    channel = bot.get_channel(channel_id)
+    if isinstance(channel, discord.TextChannel):
+        return channel
+    guild = bot.get_guild(int(guild_id))
+    if guild:
+        ch = guild.get_channel(channel_id)
+        if isinstance(ch, discord.TextChannel):
+            return ch
+    return None
+
+
+def _host_last_seen_age_seconds(host: dict | None) -> float | None:
+    if not host:
+        return None
+    try:
+        seen = _parse_ts(host.get("last_seen"))
+        return (datetime.now(timezone.utc) - seen).total_seconds()
+    except (TypeError, ValueError):
+        return None
+
+
+async def _post_pc_online(
+    guild_id: str,
+    watch: GuildWatch,
+    host: dict,
+) -> None:
+    channel = await _resolve_text_channel(guild_id, _alert_channel(watch))
+    if channel is None:
+        return
+    hostname = str(host.get("hostname") or "unknown")
+    username = str(host.get("username") or "—")
+    sw = host.get("screen_width")
+    sh = host.get("screen_height")
+    screen = f"{sw}×{sh}" if sw and sh else "unknown"
+    embed = discord.Embed(
+        title="🟢 PC online",
+        description=f"**{hostname}** · `{username}`",
+        color=0x3D9A6E,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="Screen", value=screen, inline=True)
+    embed.set_footer(text="SZCTrap · heartbeat detected")
+    try:
+        await channel.send(content=_role_mention(watch), embed=embed)
+    except discord.HTTPException as exc:
+        print(f"[bot] Online alert failed guild={guild_id}: {exc}")
+
+
+async def _post_pc_offline(
+    guild_id: str,
+    watch: GuildWatch,
+    hostname: str,
+    host: dict | None,
+) -> None:
+    channel = await _resolve_text_channel(guild_id, _alert_channel(watch))
+    if channel is None:
+        return
+    username = str((host or {}).get("username") or "—")
+    embed = discord.Embed(
+        title="🔴 PC offline",
+        description=f"**{hostname}** · `{username}`",
+        color=0xC45C5C,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(
+        name="Status",
+        value=f"No heartbeat for **{OFFLINE_AFTER_MINUTES}+** minutes",
+        inline=False,
+    )
+    embed.set_footer(text="SZCTrap · last seen expired")
+    try:
+        await channel.send(content=_role_mention(watch), embed=embed)
+    except discord.HTTPException as exc:
+        print(f"[bot] Offline alert failed guild={guild_id}: {exc}")
 
 
 def _embed_scan_started(event: dict) -> discord.Embed:
@@ -728,6 +823,81 @@ async def poll_events() -> None:
         await asyncio.sleep(POLL_INTERVAL)
 
 
+async def poll_presence() -> None:
+    """Ping alert role when PCs come online or go offline (5+ min no heartbeat)."""
+    await bot.wait_until_ready()
+
+    if not API_URL:
+        return
+
+    print(
+        f"[bot] Presence polling every {PRESENCE_POLL_INTERVAL}s "
+        f"(online ≤{ONLINE_WITHIN_MINUTES}m, offline ≥{OFFLINE_AFTER_MINUTES}m)"
+    )
+
+    while not bot.is_closed():
+        if not store.watches:
+            await asyncio.sleep(PRESENCE_POLL_INTERVAL)
+            continue
+
+        try:
+            hosts = await _fetch_online_hosts(minutes=OFFLINE_AFTER_MINUTES + 2)
+            host_by_name = {
+                str(h.get("hostname") or ""): h
+                for h in hosts
+                if h.get("hostname")
+            }
+            online_now: set[str] = set()
+            for name, host in host_by_name.items():
+                age = _host_last_seen_age_seconds(host)
+                if age is not None and age <= ONLINE_WITHIN_MINUTES * 60:
+                    online_now.add(name)
+
+            for guild_id, watch in list(store.watches.items()):
+                if not watch.alert_role_id:
+                    continue
+                if not watch.alert_on_online and not watch.alert_on_offline:
+                    continue
+
+                gstate = _presence_state.setdefault(guild_id, {})
+
+                if guild_id not in _presence_bootstrapped:
+                    for name in online_now:
+                        gstate[name] = "online"
+                    for name, host in host_by_name.items():
+                        if name not in gstate:
+                            age = _host_last_seen_age_seconds(host)
+                            gstate[name] = (
+                                "offline"
+                                if age is not None and age >= OFFLINE_AFTER_MINUTES * 60
+                                else "online"
+                                if name in online_now
+                                else "offline"
+                            )
+                    _presence_bootstrapped.add(guild_id)
+                    continue
+
+                for name in online_now:
+                    if gstate.get(name) != "online" and watch.alert_on_online:
+                        await _post_pc_online(guild_id, watch, host_by_name[name])
+                    gstate[name] = "online"
+
+                for name, status in list(gstate.items()):
+                    if status != "online" or name in online_now:
+                        continue
+                    host = host_by_name.get(name)
+                    age = _host_last_seen_age_seconds(host)
+                    if age is None or age >= OFFLINE_AFTER_MINUTES * 60:
+                        if watch.alert_on_offline:
+                            await _post_pc_offline(guild_id, watch, name, host)
+                        gstate[name] = "offline"
+
+        except httpx.HTTPError as exc:
+            print(f"[bot] Presence poll error: {exc}")
+
+        await asyncio.sleep(PRESENCE_POLL_INTERVAL)
+
+
 @pulse.command(name="sync", description="Refresh slash commands in this server (instant)")
 @app_commands.default_permissions(administrator=True)
 @app_commands.guild_only()
@@ -798,11 +968,13 @@ async def pulse_unlink(interaction: discord.Interaction) -> None:
         await interaction.response.send_message("This server is not linked. Use `/pulse link` first.", ephemeral=True)
 
 
-@pulse.command(name="alert", description="Ping a role when scans start or checks get blocked")
+@pulse.command(name="alert", description="Ping a role when scans start, PCs go online/offline, or checks get blocked")
 @app_commands.describe(
     role="Role to @mention",
     on_start="Ping when a new health scan starts",
     on_blocked="Ping when a check is blocked or detected",
+    on_online="Ping when a PC starts sending heartbeats",
+    on_offline="Ping when a PC has no heartbeat for 5+ minutes",
 )
 @app_commands.guild_only()
 async def pulse_alert(
@@ -810,6 +982,8 @@ async def pulse_alert(
     role: discord.Role,
     on_start: bool = True,
     on_blocked: bool = True,
+    on_online: bool = True,
+    on_offline: bool = True,
 ) -> None:
     gid = _guild_id(interaction)
     if gid is None:
@@ -826,14 +1000,19 @@ async def pulse_alert(
     watch.alert_role_id = role.id
     watch.alert_on_start = on_start
     watch.alert_on_blocked = on_blocked
+    watch.alert_on_online = on_online
+    watch.alert_on_offline = on_offline
     await store.persist()
 
+    ch = watch.control_channel_id or watch.channel_id
     embed = discord.Embed(
         title="Alerts configured",
         description=(
-            f"Role {role.mention} will be pinged in <#{watch.channel_id}>.\n\n"
+            f"Role {role.mention} will be pinged in <#{ch}>.\n\n"
             f"**On scan start:** {'yes' if on_start else 'no'}\n"
-            f"**On blocked/detected:** {'yes' if on_blocked else 'no'}\n\n"
+            f"**On blocked/detected:** {'yes' if on_blocked else 'no'}\n"
+            f"**On PC online:** {'yes' if on_online else 'no'}\n"
+            f"**On PC offline (5+ min):** {'yes' if on_offline else 'no'}\n\n"
             "A **scan report card** posts automatically when a full scan finishes."
         ),
         color=PULSE_COLOR,
@@ -937,7 +1116,9 @@ async def pulse_stats(interaction: discord.Interaction) -> None:
             alert_role = interaction.guild.get_role(watch.alert_role_id)
             alert_line = (
                 f"{alert_role.mention if alert_role else watch.alert_role_id} "
-                f"(start: {'on' if watch.alert_on_start else 'off'}, "
+                f"(online: {'on' if watch.alert_on_online else 'off'}, "
+                f"offline: {'on' if watch.alert_on_offline else 'off'}, "
+                f"start: {'on' if watch.alert_on_start else 'off'}, "
                 f"blocked: {'on' if watch.alert_on_blocked else 'off'})"
             )
         embed.add_field(
@@ -1047,7 +1228,7 @@ async def pulse_guide(interaction: discord.Interaction) -> None:
             "`/pulse link` — start logging here\n"
             "`/pulse unlink` — stop logging\n"
             "`/pulse live` — jump to now\n"
-            "`/pulse alert` — ping a role on start/blocked\n"
+            "`/pulse alert` — ping a role on PC online/offline, scan start, or blocked\n"
             "`/pulse alert-off` — disable role pings\n"
             "`/pulse sync` — refresh slash commands in this server\n"
             "`/pulse stats` — totals & API health\n"
@@ -1169,7 +1350,7 @@ async def help_command(interaction: discord.Interaction) -> None:
         value=(
             "`/pulse link` — in the channel where scan results should post\n"
             "`/pulse live` — optional; only events from the next scan onward\n"
-            "`/pulse alert @role` — ping a role when scans start or get blocked"
+            "`/pulse alert @role` — ping when PCs go online/offline, scans start, or get blocked"
         ),
         inline=False,
     )
@@ -1482,12 +1663,14 @@ async def on_guild_join(guild: discord.Guild) -> None:
 
 @bot.event
 async def on_ready() -> None:
-    global _poll_task
+    global _poll_task, _presence_task
     if http_client is not None:
         await store.load_from_api()
     print(f"[bot] Logged in as {bot.user} ({len(store.watches)} guild watch(es))")
     if _poll_task is None or _poll_task.done():
         _poll_task = asyncio.create_task(poll_events())
+    if _presence_task is None or _presence_task.done():
+        _presence_task = asyncio.create_task(poll_presence())
 
 
 async def main() -> None:
